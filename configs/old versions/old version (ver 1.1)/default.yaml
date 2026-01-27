@@ -1,7 +1,0 @@
-# ==== configs/default.yaml ====
-data_path: "data/"
-batch_size: 4
-epochs: 200
-lr: 0.00001  # 使用科学计数法1.0e-5，或写成0.00001
-patch_size: 400
-val_split: 0.2  # 确保小数形式正确
