@@ -1,0 +1,7 @@
+# ==== configs/default.yaml ====
+data_path: "data/"
+batch_size: 4
+epochs: 3000
+lr: 1.0e-5   # 使用科學計數法表示
+patch_size: 400 #可以改，越小可以辨識的越精細
+val_split: 0.2  # 小數形式

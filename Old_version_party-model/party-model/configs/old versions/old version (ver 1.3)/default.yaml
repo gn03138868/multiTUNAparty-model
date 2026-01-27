@@ -1,0 +1,23 @@
+# ==== configs/default.yaml ====
+data_path: "data/"
+batch_size: 4
+epochs: 1000
+lr: 1.0e-5   # 使用科學計數法表示
+
+# 數據集 patch 尺寸（輸入圖像尺寸），從 400 改小到 224
+patch_size: 224
+
+# 模型內 ViT patch 尺寸（例如切割成 16x16 小 patch）
+model_patch_size: 16
+
+val_split: 0.2  
+
+# 自動調整學習率相關參數
+lr_scheduler: True
+lr_patience: 10
+min_lr: 1.0e-7
+
+# 驗證階段預測閾值，可依數據狀況調整（例如預設 0.3）
+val_threshold: 0.3
+
+
