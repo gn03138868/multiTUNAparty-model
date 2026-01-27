@@ -7,13 +7,91 @@ A hybrid Multi-Task TransUNet architecture for a precise area recognition tool y
 
 ---
 
+## Packages in Environment
+
+### Core Dependencies
+
+| Package | Version |
+|---------|---------|
+| Python | 3.11.14 |
+| PyTorch | 2.10.0.dev20251122+cu128 |
+| torchvision | 0.25.0.dev20251122+cu128 |
+| torchaudio | 2.10.0.dev20251122+cu128 |
+| CUDA | 12.8 |
+
+### Image Processing and Augmentation
+
+| Package | Version |
+|---------|---------|
+| albumentations | 2.0.8 |
+| opencv-python | 4.11.0.86 |
+| opencv-python-headless | 4.11.0.86 |
+| Pillow | 12.0.0 |
+| scikit-image | 0.26.0 |
+| imageio | 2.37.2 |
+
+### Deep Learning and Transformers
+
+| Package | Version |
+|---------|---------|
+| timm | 1.0.22 |
+| transformers | 4.54.1 |
+| safetensors | 0.7.0 |
+| tokenizers | 0.21.4 |
+
+### Scientific Computing
+
+| Package | Version |
+|---------|---------|
+| numpy | 1.26.4 |
+| scipy | 1.16.3 |
+| pandas | 2.3.3 |
+| scikit-learn | 1.6.1 |
+
+### Visualisation and Interface
+
+| Package | Version |
+|---------|---------|
+| matplotlib | 3.9.4 |
+| gradio | 6.1.0 |
+| streamlit | 1.51.0 |
+
+### Utilities
+
+| Package | Version |
+|---------|---------|
+| tqdm | 4.67.1 |
+| PyYAML | 6.0.3 |
+| requests | 2.32.5 |
+
+### Installation
+
+To replicate this environment:
+
+```bash
+# Create conda environment
+conda create -n multitask python=3.11.14
+conda activate multitask
+
+# Install PyTorch with CUDA 12.8
+pip install torch==2.10.0.dev20251122+cu128 torchvision==0.25.0.dev20251122+cu128 torchaudio==2.10.0.dev20251122+cu128 --index-url https://download.pytorch.org/whl/nightly/cu128
+
+# Install other dependencies
+pip install albumentations==2.0.8 opencv-python==4.11.0.86 pillow==12.0.0
+pip install timm==1.0.22 transformers==4.54.1
+pip install numpy==1.26.4 scipy==1.16.3 pandas==2.3.3 scikit-learn==1.6.1 scikit-image==0.26.0
+pip install matplotlib==3.9.4 gradio==6.1.0 tqdm==4.67.1 pyyaml==6.0.3
+```
+
+---
+
 ## Introduction
 
-This is an enhanced TransUNet model specifically designed to handle **at least two markedly different types of biological images**:
+This is an enhanced TransUNet model specifically designed to handle **three markedly different types of biological images**:
 
 1. **Plant cells** - Polygonal cell wall structures
 2. **Blood cells** - Circular cells
-3. **others** - other structures
+3. **Plant roots** - Linear structures
 
 ### Key Improvements
 
@@ -50,7 +128,7 @@ data/
 │   ├── blood/         # Blood cells
 │   │   ├── images/
 │   │   └── masks/
-│   └── other/          # Others
+│   └── root/          # Roots
 │       ├── images/
 │       └── masks/
 └── val/
@@ -60,7 +138,7 @@ data/
     ├── blood/
     │   ├── images/
     │   └── masks/
-    └── other/          # Others
+    └── root/
         ├── images/
         └── masks/
 ```
@@ -75,15 +153,15 @@ data/
 │   │   ├── cell_002.jpg
 │   │   ├── blood_001.jpg   # Filename begins with blood_
 │   │   ├── blood_002.jpg
-│   │   ├── other_001.jpg    # Filename begins with other_
-│   │   └── other_002.jpg
+│   │   ├── root_001.jpg    # Filename begins with root_
+│   │   └── root_002.jpg
 │   └── masks/
 │       ├── cell_001.png
 │       ├── cell_002.png
 │       ├── blood_001.png
 │       ├── blood_002.png
-│       ├── other_001.png
-│       └── other_002.png
+│       ├── root_001.png
+│       └── root_002.png
 └── val/
     ├── images/
     └── masks/
@@ -107,12 +185,12 @@ task_structure: subfolder  # or 'filename'
 boundary_weights:
   0: 2.0    # Cell
   1: 3.0    # Blood
-  2: 5.0    # other (increase to 8.0 or 10.0 if other performance remains poor)
+  2: 5.0    # Root (increase to 8.0 or 10.0 if root performance remains poor)
 
 foreground_weights:
   0: 1.0    # Cell
   1: 1.5    # Blood
-  2: 3.0    # other (increase to 5.0 if foreground is too sparse)
+  2: 3.0    # Root (increase to 5.0 if foreground is too sparse)
 ```
 
 ### 3. Training
@@ -156,7 +234,7 @@ Blood:
   Precision: 0.8956
   Recall:    0.8734
 
-other:
+Root:
   IoU:       0.8012
   Dice:      0.8890
   Precision: 0.8889
@@ -187,9 +265,9 @@ outputs/
 
 ### If a Particular Task Performs Poorly
 
-#### Poor other Performance (Most Common)
+#### Poor Root Performance (Most Common)
 
-**Symptoms**: Others are barely detected, IoU < 0.5
+**Symptoms**: Roots are barely detected, IoU < 0.5
 
 **Solutions**:
 
@@ -202,14 +280,14 @@ foreground_weights:
   2: 5.0    # Increase from 3.0 to 5.0
 ```
 
-2. **Increase patch_size** (if others are long linear structures):
+2. **Increase patch_size** (roots are long linear structures):
 ```yaml
 patch_size: 600  # Increase from 400 to 600
 ```
 
 3. **Adjust data augmentation** (in dataset_multitask.py):
 ```python
-# Others: reduce deformation, increase contrast adjustment
+# Roots: reduce deformation, increase contrast adjustment
 configs[2] = A.Compose([
     A.RandomRotate90(p=0.5),
     A.HorizontalFlip(p=0.5),
@@ -314,8 +392,8 @@ with torch.no_grad():
     # Blood cells
     output_blood = model(image, task_id=1)
     
-    # Others
-    output_other = model(image, task_id=2)
+    # Roots
+    output_root = model(image, task_id=2)
 ```
 
 ### Batch Prediction
@@ -361,7 +439,7 @@ def predict_image(model, image_path, task_id, patch_size=400):
     return result
 
 # Usage example
-result = predict_image(model, 'test_image.jpg', task_id=2)  # Others
+result = predict_image(model, 'test_image.jpg', task_id=2)  # Roots
 result_binary = (result > 0.5).astype(np.uint8) * 255
 cv2.imwrite('prediction.png', result_binary)
 ```
@@ -381,7 +459,7 @@ Multi-task learning allows you to handle three tasks with **a single model**, wi
 
 ### Q: How does task conditioning work?
 
-A: During training and prediction, we inform the model of the type of image currently being processed (0=cell, 1=blood, 2=other). The model adjusts its internal feature representation according to the task.
+A: During training and prediction, we inform the model of the type of image currently being processed (0=cell, 1=blood, 2=root). The model adjusts its internal feature representation according to the task.
 
 ### Q: If my three image types are more similar, can I simplify matters?
 
