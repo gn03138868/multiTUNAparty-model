@@ -1,4 +1,4 @@
-# multiparty-model
+# multiTUNAparty-model
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.10.0.dev20251122+cu128-red)](https://pytorch.org/)
 [![CUDA](https://img.shields.io/badge/CUDA-12.8-green)](https://developer.nvidia.com/cuda-toolkit)
 
