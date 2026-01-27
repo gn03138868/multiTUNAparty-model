@@ -537,9 +537,9 @@ Training times on RTX 5080:
 
 | Configuration | Time per Epoch | Total Training Time (200 epochs) |
 |---------------|----------------|----------------------------------|
-| Batch Size 4, Patch 400 | Approx. 3 minutes | Approx. 10 hours |
-| Batch Size 2, Patch 400 | Approx. 4 minutes | Approx. 13 hours |
-| Batch Size 4, Patch 320 | Approx. 2 minutes | Approx. 7 hours |
+| Batch Size 4, Patch 400 | Approx. 3 minutes | Approx. 10 hours (depending on the size of images) |
+| Batch Size 2, Patch 400 | Approx. 4 minutes | Approx. 13 hours (depending on the size of images) |
+| Batch Size 4, Patch 320 | Approx. 2 minutes | Approx. 7 hours (depending on the size of images) |
 
 ---
 
