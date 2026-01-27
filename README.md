@@ -25,7 +25,7 @@ A hybrid Multi-Task TransUNet architecture for a precise area recognition tool y
 ### Prerequisites
 - NVIDIA GPU with CUDA 12.1+ support
 - Python 3.9+
-- NVIDIA RTX5080 16G
+- NVIDIA GeForce RTX5080 16G
 
 
 ### Setup Environment
