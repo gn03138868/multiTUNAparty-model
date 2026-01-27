@@ -1,6 +1,6 @@
 # multiparty-model
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0.1-red)](https://pytorch.org/)
-[![CUDA](https://img.shields.io/badge/CUDA-12.1-green)](https://developer.nvidia.com/cuda-toolkit)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.10.0-red)](https://pytorch.org/)
+[![CUDA](https://img.shields.io/badge/CUDA-12.8-green)](https://developer.nvidia.com/cuda-toolkit)
 
 A hybrid Multi-Task TransUNet architecture for a precise area recognition tool ya (multiparty).
 
