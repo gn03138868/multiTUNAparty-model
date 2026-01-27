@@ -91,7 +91,7 @@ This is an enhanced TransUNet model specifically designed to handle **three mark
 
 1. **Plant cells** - Polygonal cell wall structures
 2. **Blood cells** - Circular cells
-3. **Plant roots** - Linear structures
+3. **Others** - Other structures
 
 ### Key Improvements
 
@@ -128,7 +128,7 @@ data/
 │   ├── blood/         # Blood cells
 │   │   ├── images/
 │   │   └── masks/
-│   └── root/          # Roots
+│   └── Other/          # Others
 │       ├── images/
 │       └── masks/
 └── val/
@@ -138,7 +138,7 @@ data/
     ├── blood/
     │   ├── images/
     │   └── masks/
-    └── root/
+    └── Other/
         ├── images/
         └── masks/
 ```
@@ -153,15 +153,15 @@ data/
 │   │   ├── cell_002.jpg
 │   │   ├── blood_001.jpg   # Filename begins with blood_
 │   │   ├── blood_002.jpg
-│   │   ├── root_001.jpg    # Filename begins with root_
-│   │   └── root_002.jpg
+│   │   ├── Other_001.jpg    # Filename begins with Other_
+│   │   └── Other_002.jpg
 │   └── masks/
 │       ├── cell_001.png
 │       ├── cell_002.png
 │       ├── blood_001.png
 │       ├── blood_002.png
-│       ├── root_001.png
-│       └── root_002.png
+│       ├── Other_001.png
+│       └── Other_002.png
 └── val/
     ├── images/
     └── masks/
@@ -185,12 +185,12 @@ task_structure: subfolder  # or 'filename'
 boundary_weights:
   0: 2.0    # Cell
   1: 3.0    # Blood
-  2: 5.0    # Root (increase to 8.0 or 10.0 if root performance remains poor)
+  2: 5.0    # Other (increase to 8.0 or 10.0 if Other performance remains poor)
 
 foreground_weights:
   0: 1.0    # Cell
   1: 1.5    # Blood
-  2: 3.0    # Root (increase to 5.0 if foreground is too sparse)
+  2: 3.0    # Other (increase to 5.0 if foreground is too sparse)
 ```
 
 ### 3. Training
@@ -234,7 +234,7 @@ Blood:
   Precision: 0.8956
   Recall:    0.8734
 
-Root:
+Other:
   IoU:       0.8012
   Dice:      0.8890
   Precision: 0.8889
@@ -265,9 +265,9 @@ outputs/
 
 ### If a Particular Task Performs Poorly
 
-#### Poor Root Performance (Most Common)
+#### Poor Other Performance (Most Common)
 
-**Symptoms**: Roots are barely detected, IoU < 0.5
+**Symptoms**: Others are barely detected, IoU < 0.5
 
 **Solutions**:
 
@@ -280,14 +280,14 @@ foreground_weights:
   2: 5.0    # Increase from 3.0 to 5.0
 ```
 
-2. **Increase patch_size** (roots are long linear structures):
+2. **Increase patch_size** (Others are long linear structures):
 ```yaml
 patch_size: 600  # Increase from 400 to 600
 ```
 
 3. **Adjust data augmentation** (in dataset_multitask.py):
 ```python
-# Roots: reduce deformation, increase contrast adjustment
+# Others: reduce deformation, increase contrast adjustment
 configs[2] = A.Compose([
     A.RandomRotate90(p=0.5),
     A.HorizontalFlip(p=0.5),
@@ -392,8 +392,8 @@ with torch.no_grad():
     # Blood cells
     output_blood = model(image, task_id=1)
     
-    # Roots
-    output_root = model(image, task_id=2)
+    # Others
+    output_Other = model(image, task_id=2)
 ```
 
 ### Batch Prediction
@@ -439,7 +439,7 @@ def predict_image(model, image_path, task_id, patch_size=400):
     return result
 
 # Usage example
-result = predict_image(model, 'test_image.jpg', task_id=2)  # Roots
+result = predict_image(model, 'test_image.jpg', task_id=2)  # Others
 result_binary = (result > 0.5).astype(np.uint8) * 255
 cv2.imwrite('prediction.png', result_binary)
 ```
@@ -459,7 +459,7 @@ Multi-task learning allows you to handle three tasks with **a single model**, wi
 
 ### Q: How does task conditioning work?
 
-A: During training and prediction, we inform the model of the type of image currently being processed (0=cell, 1=blood, 2=root). The model adjusts its internal feature representation according to the task.
+A: During training and prediction, we inform the model of the type of image currently being processed (0=cell, 1=blood, 2=Other). The model adjusts its internal feature representation according to the task.
 
 ### Q: If my three image types are more similar, can I simplify matters?
 
