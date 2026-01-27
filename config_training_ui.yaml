@@ -1,0 +1,15 @@
+batch_size: 4
+boundary_weights:
+  0: 2.0
+  1: 3.0
+  2: 5.0
+data_path: data/
+epochs: 200
+foreground_weights:
+  0: 1.0
+  1: 1.5
+  2: 3.0
+lr: 1.0e-05
+num_decoder_conv_layers: 80
+patch_size: 400
+task_structure: subfolder

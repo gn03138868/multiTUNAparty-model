@@ -1,0 +1,4604 @@
+#####dataset_multitask.py
+
+"""
+多任務分割資料集
+支援自動識別或手動指定影像任務類型
+"""
+
+import os
+import cv2
+import numpy as np
+import albumentations as A
+from torch.utils.data import Dataset
+import torch
+from pathlib import Path
+
+class MultiTaskSegmentationDataset(Dataset):
+    """
+    多任務分割資料集
+    
+    資料夾結構方案一（推薦）- 按任務分類：
+    data/
+    ├── train/
+    │   ├── cell/          # 植物細胞
+    │   │   ├── images/
+    │   │   └── masks/
+    │   ├── blood/         # 血球
+    │   │   ├── images/
+    │   │   └── masks/
+    │   └── root/          # 根系
+    │       ├── images/
+    │       └── masks/
+    
+    資料夾結構方案二 - 傳統結構（需要在檔名中標記任務）：
+    data/
+    ├── train/
+    │   ├── images/
+    │   │   ├── cell_001.jpg
+    │   │   ├── blood_001.jpg
+    │   │   └── root_001.jpg
+    │   └── masks/
+    │       ├── cell_001.png
+    │       ├── blood_001.png
+    │       └── root_001.png
+    """
+    
+    TASK_MAPPING = {
+        'cell': 0,    # 植物細胞
+        'blood': 1,   # 血球
+        'root': 2     # 根系
+    }
+    
+    def __init__(
+        self, 
+        data_root, 
+        mode='train', 
+        patch_size=400,
+        task_structure='subfolder',  # 'subfolder' 或 'filename'
+        augment_params=None
+    ):
+        """
+        Args:
+            data_root: 資料根目錄
+            mode: 'train', 'val', 或 'test'
+            patch_size: patch 大小
+            task_structure: 
+                - 'subfolder': 任務按子資料夾分類
+                - 'filename': 任務標記在檔名中 (e.g., cell_001.jpg)
+            augment_params: 自定義的數據增強參數字典
+        """
+        self.data_root = data_root
+        self.mode = mode
+        self.patch_size = patch_size
+        self.task_structure = task_structure
+        
+        # 載入所有影像和對應的任務標籤
+        self.samples = []  # [(image_path, mask_path, task_id), ...]
+        self._load_samples()
+        
+        # 配置數據增強
+        self.augment_configs = self._get_augmentation_configs(augment_params)
+        
+        # 預先生成所有 patches
+        self.patches = []
+        self._precompute_patches()
+        
+        print(f"Loaded {len(self.patches)} patches from {len(self.samples)} images")
+        self._print_task_distribution()
+    
+    def _load_samples(self):
+        """載入所有影像樣本和對應的任務標籤"""
+        
+        if self.task_structure == 'subfolder':
+            # 方案一：按子資料夾分類
+            base_path = Path(self.data_root) / self.mode
+            
+            for task_name, task_id in self.TASK_MAPPING.items():
+                task_path = base_path / task_name
+                
+                if not task_path.exists():
+                    continue
+                
+                image_dir = task_path / 'images'
+                mask_dir = task_path / 'masks'
+                
+                if not image_dir.exists() or not mask_dir.exists():
+                    continue
+                
+                image_files = sorted([f for f in os.listdir(image_dir) 
+                                    if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
+                
+                for img_file in image_files:
+                    # 尋找對應的 mask（可能是 .png 或其他格式）
+                    mask_file = self._find_matching_mask(img_file, mask_dir)
+                    
+                    if mask_file:
+                        img_path = image_dir / img_file
+                        mask_path = mask_dir / mask_file
+                        self.samples.append((str(img_path), str(mask_path), task_id))
+        
+        else:  # 'filename'
+            # 方案二：從檔名中識別任務類型
+            image_dir = Path(self.data_root) / self.mode / 'images'
+            mask_dir = Path(self.data_root) / self.mode / 'masks'
+            
+            if not image_dir.exists():
+                raise ValueError(f"Image directory not found: {image_dir}")
+            
+            image_files = sorted([f for f in os.listdir(image_dir) 
+                                if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
+            
+            for img_file in image_files:
+                # 從檔名中提取任務類型
+                task_id = self._extract_task_from_filename(img_file)
+                
+                mask_file = self._find_matching_mask(img_file, mask_dir)
+                
+                if mask_file:
+                    img_path = image_dir / img_file
+                    mask_path = mask_dir / mask_file
+                    self.samples.append((str(img_path), str(mask_path), task_id))
+    
+    def _find_matching_mask(self, img_file, mask_dir):
+        """尋找對應的 mask 檔案"""
+        base_name = os.path.splitext(img_file)[0]
+        
+        # 嘗試不同的擴展名
+        for ext in ['.png', '.PNG', '.jpg', '.JPG', '.jpeg', '.JPEG']:
+            mask_file = base_name + ext
+            if (mask_dir / mask_file).exists():
+                return mask_file
+        
+        return None
+    
+    def _extract_task_from_filename(self, filename):
+        """從檔名中提取任務類型"""
+        filename_lower = filename.lower()
+        
+        for task_name, task_id in self.TASK_MAPPING.items():
+            if filename_lower.startswith(task_name):
+                return task_id
+        
+        # 預設為細胞任務
+        print(f"Warning: Cannot determine task type from filename '{filename}', defaulting to 'cell'")
+        return 0
+    
+    def _get_augmentation_configs(self, augment_params=None):
+        """
+        為不同任務配置不同的數據增強策略
+        """
+        if augment_params:
+            # 使用自定義參數
+            return {
+                0: self._build_transform(augment_params.get('cell', {})),
+                1: self._build_transform(augment_params.get('blood', {})),
+                2: self._build_transform(augment_params.get('root', {}))
+            }
+        
+        # 預設配置
+        configs = {}
+        
+        # 植物細胞：需要保持多邊形結構，使用適度的形變
+        configs[0] = A.Compose([
+            A.RandomRotate90(p=0.5),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
+            A.ElasticTransform(alpha=1, sigma=50, p=0.2),
+            A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.2)
+        ], additional_targets={'mask': 'mask'})
+        
+        # 血球：圓形結構，需要較少的形變
+        configs[1] = A.Compose([
+            A.RandomRotate90(p=0.5),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.4),
+            A.ElasticTransform(alpha=0.5, sigma=30, p=0.15),  # 較小的形變
+            A.GaussNoise(var_limit=(10.0, 30.0), p=0.2)  # 添加噪聲模擬染色不均
+        ], additional_targets={'mask': 'mask'})
+        
+        # 根系：線性結構，主要調整對比度，避免過度形變
+        configs[2] = A.Compose([
+            A.RandomRotate90(p=0.5),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.4, p=0.5),
+            # 根系不使用 ElasticTransform 和 GridDistortion
+            A.GaussianBlur(blur_limit=(3, 5), p=0.2)  # 輕微模糊模擬不同焦距
+        ], additional_targets={'mask': 'mask'})
+        
+        return configs
+    
+    def _build_transform(self, params):
+        """根據參數構建數據增強"""
+        transforms = []
+        
+        if params.get('rotate', True):
+            transforms.append(A.RandomRotate90(p=0.5))
+        if params.get('hflip', True):
+            transforms.append(A.HorizontalFlip(p=0.5))
+        if params.get('vflip', True):
+            transforms.append(A.VerticalFlip(p=0.5))
+        if params.get('brightness', True):
+            transforms.append(A.RandomBrightnessContrast(p=0.3))
+        
+        return A.Compose(transforms, additional_targets={'mask': 'mask'})
+    
+    def _precompute_patches(self):
+        """預先生成所有 patches"""
+        for img_path, mask_path, task_id in self.samples:
+            try:
+                image = cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB)
+                mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                
+                if image is None or mask is None:
+                    print(f"Warning: Failed to load {img_path} or {mask_path}")
+                    continue
+                
+                # 驗證尺寸
+                if image.shape[:2] != mask.shape:
+                    print(f"Warning: Size mismatch in {img_path}")
+                    continue
+                
+                # 生成 patches
+                patches = self._extract_patches(image, mask, task_id)
+                self.patches.extend(patches)
+                
+            except Exception as e:
+                print(f"Error processing {img_path}: {e}")
+    
+    def _extract_patches(self, image, mask, task_id):
+        """提取 patches"""
+        h, w = image.shape[:2]
+        stride = self.patch_size // 2  # 50% 重疊
+        patches = []
+        
+        for y in range(0, h - self.patch_size + 1, stride):
+            for x in range(0, w - self.patch_size + 1, stride):
+                img_patch = image[y:y+self.patch_size, x:x+self.patch_size]
+                mask_patch = mask[y:y+self.patch_size, x:x+self.patch_size]
+                
+                # 訓練時應用任務特定的數據增強
+                if self.mode == 'train':
+                    augmented = self.augment_configs[task_id](
+                        image=img_patch, 
+                        mask=mask_patch
+                    )
+                    img_patch = augmented['image']
+                    mask_patch = augmented['mask']
+                
+                patches.append((img_patch, mask_patch, task_id))
+        
+        return patches
+    
+    def _print_task_distribution(self):
+        """列印任務分佈"""
+        task_counts = {0: 0, 1: 0, 2: 0}
+        for _, _, task_id in self.patches:
+            task_counts[task_id] += 1
+        
+        task_names = {0: 'Cell', 1: 'Blood', 2: 'Root'}
+        print(f"\nTask distribution in {self.mode} set:")
+        for task_id, count in task_counts.items():
+            print(f"  {task_names[task_id]}: {count} patches")
+    
+    def __len__(self):
+        return len(self.patches)
+    
+    def __getitem__(self, idx):
+        img_patch, mask_patch, task_id = self.patches[idx]
+        
+        # 歸一化並轉換為 Tensor
+        img_tensor = torch.from_numpy(
+            img_patch.astype(np.float32) / 255.0
+        ).permute(2, 0, 1)
+        
+        mask_tensor = torch.from_numpy(
+            (mask_patch / 255.0).astype(np.float32)
+        ).unsqueeze(0)
+        
+        task_tensor = torch.tensor(task_id, dtype=torch.long)
+        
+        return img_tensor, mask_tensor, task_tensor
+    
+    @staticmethod
+    def get_task_name(task_id):
+        """獲取任務名稱"""
+        task_names = {0: 'Cell', 1: 'Blood', 2: 'Root'}
+        return task_names.get(task_id, 'Unknown')
+
+
+# ============================================================================
+# 測試程式碼
+# ============================================================================
+
+if __name__ == '__main__':
+    print("Testing MultiTaskSegmentationDataset...")
+    
+    # 測試資料夾結構方案一
+    try:
+        dataset = MultiTaskSegmentationDataset(
+            data_root='data',
+            mode='train',
+            patch_size=400,
+            task_structure='subfolder'
+        )
+        
+        print(f"\nTotal patches: {len(dataset)}")
+        
+        # 測試載入一個樣本
+        if len(dataset) > 0:
+            img, mask, task = dataset[0]
+            print(f"\nSample 0:")
+            print(f"  Image shape: {img.shape}")
+            print(f"  Mask shape: {mask.shape}")
+            print(f"  Task: {MultiTaskSegmentationDataset.get_task_name(task.item())}")
+    
+    except Exception as e:
+        print(f"Error: {e}")
+        print("\nPlease check your data structure:")
+        print("data/")
+        print("├── train/")
+        print("│   ├── cell/")
+        print("│   │   ├── images/")
+        print("│   │   └── masks/")
+        print("│   ├── blood/")
+        print("│   │   ├── images/")
+        print("│   │   └── masks/")
+        print("│   └── root/")
+        print("│       ├── images/")
+        print("│       └── masks/")
+
+
+#####losses_multitask.py
+"""
+多任務損失函數
+針對不同任務使用不同的權重策略
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import cv2
+import numpy as np
+
+class MultiTaskLoss(nn.Module):
+    """
+    多任務損失函數
+    
+    針對不同任務的特性設計不同的損失權重：
+    - 植物細胞 (task 0): 平衡的權重
+    - 血球 (task 1): 略微增加邊界權重
+    - 根系 (task 2): 大幅增加邊界權重和前景權重
+    """
+    def __init__(
+        self,
+        base_weights=None,
+        boundary_weights=None,
+        foreground_weights=None,
+        smooth=1e-5
+    ):
+        """
+        Args:
+            base_weights: 基礎損失權重 {task_id: weight}
+            boundary_weights: 邊界損失權重 {task_id: weight}
+            foreground_weights: 前景損失權重 {task_id: weight}
+        """
+        super().__init__()
+        
+        # 預設權重配置
+        self.base_weights = base_weights or {
+            0: 1.0,  # 細胞
+            1: 1.0,  # 血球
+            2: 1.0   # 根系
+        }
+        
+        self.boundary_weights = boundary_weights or {
+            0: 2.0,   # 細胞：中等邊界權重
+            1: 3.0,   # 血球：較高邊界權重（圓形邊界很重要）
+            2: 5.0    # 根系：最高邊界權重（線性結構全是邊界）
+        }
+        
+        self.foreground_weights = foreground_weights or {
+            0: 1.0,   # 細胞：平衡
+            1: 1.5,   # 血球：略微增加前景權重
+            2: 3.0    # 根系：大幅增加前景權重（前景比例極小）
+        }
+        
+        self.smooth = smooth
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+    
+    def forward(self, predictions, targets, task_ids):
+        """
+        Args:
+            predictions: 模型輸出 [B, 1, H, W]
+            targets: 真實標籤 [B, 1, H, W]
+            task_ids: 任務ID [B]
+        """
+        batch_size = predictions.shape[0]
+        total_loss = 0.0
+        
+        # 分別計算每個樣本的損失
+        for i in range(batch_size):
+            pred = predictions[i:i+1]
+            target = targets[i:i+1]
+            task_id = task_ids[i].item()
+            
+            # 基礎 Dice + BCE 損失
+            base_loss = self._compute_base_loss(pred, target)
+            
+            # 邊界損失
+            boundary_loss = self._compute_boundary_loss(pred, target)
+            
+            # 前景加權損失（針對前景比例極小的情況，如根系）
+            foreground_loss = self._compute_foreground_loss(pred, target)
+            
+            # 組合損失，使用任務特定的權重
+            sample_loss = (
+                self.base_weights[task_id] * base_loss +
+                self.boundary_weights[task_id] * boundary_loss +
+                self.foreground_weights[task_id] * foreground_loss
+            )
+            
+            total_loss += sample_loss
+        
+        return total_loss / batch_size
+    
+    def _compute_base_loss(self, pred, target):
+        """基礎 Dice + BCE 損失"""
+        # Dice Loss
+        pred_sigmoid = torch.sigmoid(pred).clamp(min=1e-7, max=1-1e-7)
+        pred_flat = pred_sigmoid.view(-1)
+        target_flat = target.view(-1)
+        
+        intersection = (pred_flat * target_flat).sum()
+        union = pred_flat.sum() + target_flat.sum()
+        
+        dice = (2. * intersection + self.smooth) / (union + self.smooth)
+        dice_loss = 1 - dice
+        
+        # BCE Loss
+        bce_loss = self.bce(pred, target).mean()
+        
+        return dice_loss + bce_loss
+    
+    def _compute_boundary_loss(self, pred, target):
+        """
+        邊界損失：使用距離變換強調邊界區域
+        """
+        pred_sigmoid = torch.sigmoid(pred).clamp(min=1e-7, max=1-1e-7)
+        target_binary = (target > 0.5).float()
+        
+        # 計算距離變換（在 CPU 上）
+        target_np = target_binary[0, 0].detach().cpu().numpy().astype(np.uint8)
+        
+        # 計算背景的距離變換
+        dist_map = cv2.distanceTransform(1 - target_np, cv2.DIST_L2, 5)
+        dist_tensor = torch.tensor(dist_map, dtype=pred.dtype, device=pred.device)
+        
+        # 限制最大距離，避免過大的權重
+        dist_tensor = torch.clamp(dist_tensor, max=10.0)
+        
+        # 使用距離作為權重計算損失
+        loss = torch.mean(dist_tensor * torch.abs(pred_sigmoid[0, 0] - target_binary[0, 0]))
+        
+        return loss
+    
+    def _compute_foreground_loss(self, pred, target):
+        """
+        前景加權損失：針對前景比例極小的情況（如根系）
+        給予前景像素更高的權重
+        """
+        pred_sigmoid = torch.sigmoid(pred).clamp(min=1e-7, max=1-1e-7)
+        
+        # 計算前景和背景的權重
+        fg_mask = (target > 0.5).float()
+        bg_mask = (target <= 0.5).float()
+        
+        # 前景像素數量
+        fg_count = fg_mask.sum()
+        bg_count = bg_mask.sum()
+        
+        if fg_count == 0:
+            return torch.tensor(0.0, device=pred.device)
+        
+        # 動態計算權重：前景越少，權重越高
+        fg_weight = bg_count / (fg_count + 1e-7)
+        fg_weight = torch.clamp(fg_weight, min=1.0, max=10.0)
+        
+        # 計算加權的 BCE 損失
+        fg_loss = F.binary_cross_entropy(pred_sigmoid, target, reduction='none')
+        fg_loss = fg_loss * (fg_mask * fg_weight + bg_mask)
+        
+        return fg_loss.mean()
+
+
+class TaskBalancedSampler:
+    """
+    任務平衡採樣器
+    確保每個 batch 中包含不同任務的樣本
+    """
+    def __init__(self, dataset, batch_size=4, drop_last=False):
+        """
+        Args:
+            dataset: MultiTaskSegmentationDataset
+            batch_size: batch 大小
+            drop_last: 是否丟棄最後不完整的 batch
+        """
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        
+        # 按任務分組索引
+        self.task_indices = {0: [], 1: [], 2: []}
+        for idx, (_, _, task_id) in enumerate(dataset.patches):
+            self.task_indices[task_id].append(idx)
+        
+        # 計算每個任務的樣本數
+        self.task_counts = {
+            task_id: len(indices) 
+            for task_id, indices in self.task_indices.items()
+        }
+        
+        print(f"Task counts: {self.task_counts}")
+    
+    def __iter__(self):
+        """產生平衡的 batch 索引"""
+        # 隨機打亂每個任務的索引
+        for task_id in self.task_indices:
+            np.random.shuffle(self.task_indices[task_id])
+        
+        # 當前各任務的指針
+        task_pointers = {0: 0, 1: 0, 2: 0}
+        
+        batch_indices = []
+        
+        while True:
+            # 檢查是否所有任務都已用完
+            if all(
+                task_pointers[task_id] >= len(self.task_indices[task_id])
+                for task_id in [0, 1, 2]
+            ):
+                break
+            
+            # 嘗試從每個任務中取樣
+            for task_id in [0, 1, 2]:
+                if task_pointers[task_id] < len(self.task_indices[task_id]):
+                    idx = self.task_indices[task_id][task_pointers[task_id]]
+                    batch_indices.append(idx)
+                    task_pointers[task_id] += 1
+                    
+                    # 當 batch 滿了，返回
+                    if len(batch_indices) == self.batch_size:
+                        yield batch_indices
+                        batch_indices = []
+        
+        # 處理剩餘的樣本
+        if len(batch_indices) > 0 and not self.drop_last:
+            yield batch_indices
+    
+    def __len__(self):
+        """計算總 batch 數"""
+        total_samples = sum(self.task_counts.values())
+        if self.drop_last:
+            return total_samples // self.batch_size
+        else:
+            return (total_samples + self.batch_size - 1) // self.batch_size
+
+
+# ============================================================================
+# 輔助函數
+# ============================================================================
+
+def compute_metrics(predictions, targets, task_ids, threshold=0.5):
+    """
+    計算分割指標
+    
+    Returns:
+        dict: 包含整體和各任務的 IoU, Dice, Precision, Recall
+    """
+    pred_binary = (torch.sigmoid(predictions) > threshold).float()
+    target_binary = (targets > 0.5).float()
+    
+    metrics = {
+        'overall': {'iou': 0, 'dice': 0, 'precision': 0, 'recall': 0, 'count': 0},
+        0: {'iou': 0, 'dice': 0, 'precision': 0, 'recall': 0, 'count': 0},
+        1: {'iou': 0, 'dice': 0, 'precision': 0, 'recall': 0, 'count': 0},
+        2: {'iou': 0, 'dice': 0, 'precision': 0, 'recall': 0, 'count': 0}
+    }
+    
+    batch_size = predictions.shape[0]
+    
+    for i in range(batch_size):
+        pred = pred_binary[i].view(-1)
+        target = target_binary[i].view(-1)
+        task_id = task_ids[i].item()
+        
+        # 計算交集和並集
+        intersection = (pred * target).sum().item()
+        union = (pred + target).clamp(0, 1).sum().item()
+        
+        # 計算 TP, FP, FN
+        tp = intersection
+        fp = (pred * (1 - target)).sum().item()
+        fn = ((1 - pred) * target).sum().item()
+        
+        # IoU
+        iou = intersection / (union + 1e-7)
+        
+        # Dice
+        dice = (2 * intersection) / (pred.sum().item() + target.sum().item() + 1e-7)
+        
+        # Precision and Recall
+        precision = tp / (tp + fp + 1e-7)
+        recall = tp / (tp + fn + 1e-7)
+        
+        # 更新整體指標
+        metrics['overall']['iou'] += iou
+        metrics['overall']['dice'] += dice
+        metrics['overall']['precision'] += precision
+        metrics['overall']['recall'] += recall
+        metrics['overall']['count'] += 1
+        
+        # 更新任務特定指標
+        metrics[task_id]['iou'] += iou
+        metrics[task_id]['dice'] += dice
+        metrics[task_id]['precision'] += precision
+        metrics[task_id]['recall'] += recall
+        metrics[task_id]['count'] += 1
+    
+    # 計算平均值
+    for key in metrics:
+        if metrics[key]['count'] > 0:
+            for metric in ['iou', 'dice', 'precision', 'recall']:
+                metrics[key][metric] /= metrics[key]['count']
+    
+    return metrics
+
+
+def print_metrics(metrics, epoch=None):
+    """列印指標"""
+    if epoch is not None:
+        print(f"\n{'='*60}")
+        print(f"Epoch {epoch} Metrics")
+        print(f"{'='*60}")
+    
+    task_names = {0: 'Cell', 1: 'Blood', 2: 'Root'}
+    
+    # 整體指標
+    print(f"\nOverall:")
+    print(f"  IoU:       {metrics['overall']['iou']:.4f}")
+    print(f"  Dice:      {metrics['overall']['dice']:.4f}")
+    print(f"  Precision: {metrics['overall']['precision']:.4f}")
+    print(f"  Recall:    {metrics['overall']['recall']:.4f}")
+    
+    # 各任務指標
+    for task_id in [0, 1, 2]:
+        if metrics[task_id]['count'] > 0:
+            print(f"\n{task_names[task_id]}:")
+            print(f"  IoU:       {metrics[task_id]['iou']:.4f}")
+            print(f"  Dice:      {metrics[task_id]['dice']:.4f}")
+            print(f"  Precision: {metrics[task_id]['precision']:.4f}")
+            print(f"  Recall:    {metrics[task_id]['recall']:.4f}")
+
+
+# ============================================================================
+# 測試程式碼
+# ============================================================================
+
+if __name__ == '__main__':
+    print("Testing MultiTaskLoss...")
+    
+    # 創建測試數據
+    batch_size = 4
+    predictions = torch.randn(batch_size, 1, 256, 256)
+    targets = torch.randint(0, 2, (batch_size, 1, 256, 256)).float()
+    task_ids = torch.tensor([0, 1, 2, 0])  # 混合任務
+    
+    # 測試損失函數
+    loss_fn = MultiTaskLoss()
+    loss = loss_fn(predictions, targets, task_ids)
+    print(f"Loss: {loss.item():.4f}")
+    
+    # 測試指標計算
+    metrics = compute_metrics(predictions, targets, task_ids)
+    print_metrics(metrics)
+    
+    print("\n✓ All tests passed!")
+
+
+
+#####model_multitask.py
+"""
+多任務 TransUNet - 針對植物細胞、血球、根系三種影像的改進版本
+主要改進：
+1. 任務條件化 (Task Conditioning)
+2. 多尺度特徵融合 (ASPP)
+3. 通道和空間注意力機制
+4. 計算成本增加不到 15%
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+# ============================================================================
+# 注意力模塊
+# ============================================================================
+
+class ChannelAttention(nn.Module):
+    """通道注意力 - 幫助模型關注重要的特徵通道"""
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, channels // reduction, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, 1, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        out = self.sigmoid(avg_out + max_out)
+        return x * out
+
+class SpatialAttention(nn.Module):
+    """空間注意力 - 幫助模型關注重要的空間位置"""
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size//2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        out = torch.cat([avg_out, max_out], dim=1)
+        out = self.sigmoid(self.conv(out))
+        return x * out
+
+class CBAM(nn.Module):
+    """CBAM - 結合通道和空間注意力"""
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.channel_attention = ChannelAttention(channels, reduction)
+        self.spatial_attention = SpatialAttention()
+    
+    def forward(self, x):
+        x = self.channel_attention(x)
+        x = self.spatial_attention(x)
+        return x
+
+
+# ============================================================================
+# 多尺度特徵融合模塊
+# ============================================================================
+
+class ASPP(nn.Module):
+    """
+    Atrous Spatial Pyramid Pooling - 多尺度特徵提取
+    對於細胞用小膨脹率，對於根系用大膨脹率
+    使用 GroupNorm 以支援 batch_size=1 的情況
+    """
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        
+        # 不同膨脹率的卷積 - 捕捉不同尺度的特徵
+        # 使用 GroupNorm 替代 BatchNorm（不受 batch size 限制）
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 1, bias=False),
+            nn.GroupNorm(32, out_channels),  # 32 groups
+            nn.ReLU(inplace=True)
+        )
+        
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=6, dilation=6, bias=False),
+            nn.GroupNorm(32, out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=12, dilation=12, bias=False),
+            nn.GroupNorm(32, out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.conv4 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=18, dilation=18, bias=False),
+            nn.GroupNorm(32, out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        # 全局平均池化分支
+        self.global_pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, out_channels, 1, bias=False),
+            nn.GroupNorm(32, out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        # 融合所有分支
+        self.fusion = nn.Sequential(
+            nn.Conv2d(out_channels * 5, out_channels, 1, bias=False),
+            nn.GroupNorm(32, out_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1)
+        )
+    
+    def forward(self, x):
+        size = x.shape[2:]
+        
+        feat1 = self.conv1(x)
+        feat2 = self.conv2(x)
+        feat3 = self.conv3(x)
+        feat4 = self.conv4(x)
+        feat5 = F.interpolate(self.global_pool(x), size=size, mode='bilinear', align_corners=False)
+        
+        out = torch.cat([feat1, feat2, feat3, feat4, feat5], dim=1)
+        out = self.fusion(out)
+        
+        return out
+
+
+# ============================================================================
+# 任務嵌入模塊
+# ============================================================================
+
+class TaskEmbedding(nn.Module):
+    """
+    任務條件化 - 讓模型知道當前處理的是哪種影像
+    task_id: 0=植物細胞, 1=血球, 2=根系
+    """
+    def __init__(self, num_tasks=3, embed_dim=256):
+        super().__init__()
+        self.embedding = nn.Embedding(num_tasks, embed_dim)
+        self.norm = nn.LayerNorm(embed_dim)
+    
+    def forward(self, task_id, batch_size):
+        # task_id: 單一整數或 tensor
+        if isinstance(task_id, int):
+            task_id = torch.tensor([task_id] * batch_size, dtype=torch.long)
+        
+        task_emb = self.embedding(task_id.to(self.embedding.weight.device))
+        task_emb = self.norm(task_emb)
+        
+        return task_emb  # [B, embed_dim]
+
+
+# ============================================================================
+# 改進的 Decoder 塊
+# ============================================================================
+
+class ImprovedDecoderBlock(nn.Module):
+    """
+    改進的解碼塊：
+    1. 整合任務嵌入
+    2. 添加注意力機制
+    3. 殘差連接
+    使用 GroupNorm 以支援 batch_size=1
+    """
+    def __init__(self, in_channels, out_channels, task_embed_dim=256):
+        super().__init__()
+        
+        # 任務條件化的投影層
+        self.task_proj = nn.Linear(task_embed_dim, in_channels)
+        
+        # 主要卷積層（使用 GroupNorm）
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False),
+            nn.GroupNorm(min(32, out_channels), out_channels),  # 確保 groups <= channels
+            nn.ReLU(inplace=True)
+        )
+        
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
+            nn.GroupNorm(min(32, out_channels), out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        # 注意力機制
+        self.attention = CBAM(out_channels)
+        
+        # 殘差連接的投影層
+        self.residual_proj = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+    
+    def forward(self, x, task_emb=None):
+        residual = x
+        
+        # 如果有任務嵌入，添加到特徵中
+        if task_emb is not None:
+            task_weight = self.task_proj(task_emb)  # [B, in_channels]
+            task_weight = task_weight.unsqueeze(-1).unsqueeze(-1)  # [B, in_channels, 1, 1]
+            x = x + task_weight
+        
+        # 主要卷積
+        out = self.conv1(x)
+        out = self.conv2(out)
+        
+        # 注意力
+        out = self.attention(out)
+        
+        # 殘差連接
+        out = out + self.residual_proj(residual)
+        
+        return out
+
+
+# ============================================================================
+# 主模型：多任務 TransUNet
+# ============================================================================
+
+class MultiTaskTransUNet(nn.Module):
+    """
+    多任務 TransUNet
+    
+    主要特性：
+    1. 任務條件化編碼器和解碼器
+    2. 多尺度特徵融合 (ASPP)
+    3. 注意力機制
+    4. 保持原始 TransUNet 的 ViT encoder 結構
+    """
+    def __init__(
+        self,
+        img_size=400,
+        patch_size=16,
+        in_channels=3,
+        num_classes=1,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        mlp_ratio=4,
+        num_decoder_layers=80,
+        num_tasks=3,
+        task_embed_dim=256
+    ):
+        super().__init__()
+        
+        # 任務嵌入
+        self.task_embedding = TaskEmbedding(num_tasks, task_embed_dim)
+        
+        # ViT Encoder (保持原始 TransUNet 結構)
+        self.patch_embed = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+        
+        num_patches = (img_size // patch_size) ** 2
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
+        self.pos_drop = nn.Dropout(p=0.1)
+        
+        # Transformer blocks
+        self.blocks = nn.ModuleList([
+            TransformerBlock(embed_dim, num_heads, mlp_ratio)
+            for _ in range(depth)
+        ])
+        
+        self.norm = nn.LayerNorm(embed_dim)
+        
+        # 多尺度特徵融合
+        self.aspp = ASPP(embed_dim, 256)
+        
+        # Decoder - 使用改進的解碼塊
+        decoder_channels = [256, 128, 64, 32]
+        self.decoder_blocks = nn.ModuleList()
+        
+        in_ch = 256
+        for i, out_ch in enumerate(decoder_channels):
+            layers = []
+            # 每個階段使用多個改進的解碼塊
+            num_blocks = num_decoder_layers // len(decoder_channels)
+            for j in range(num_blocks):
+                if j == 0:
+                    layers.append(ImprovedDecoderBlock(in_ch, out_ch, task_embed_dim))
+                else:
+                    layers.append(ImprovedDecoderBlock(out_ch, out_ch, task_embed_dim))
+            self.decoder_blocks.append(nn.ModuleList(layers))
+            in_ch = out_ch
+        
+        # 上採樣層
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        
+        # 最終輸出層
+        self.final_conv = nn.Sequential(
+            nn.Conv2d(32, 16, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, num_classes, 1)
+        )
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        # 初始化位置嵌入
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        
+        # 初始化其他權重
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x, task_id=0):
+        """
+        Args:
+            x: 輸入影像 [B, 3, H, W]
+            task_id: 任務ID (0=植物細胞, 1=血球, 2=根系)
+        """
+        B, C, H, W = x.shape
+        
+        # 獲取任務嵌入
+        task_emb = self.task_embedding(task_id, B)  # [B, task_embed_dim]
+        
+        # Patch embedding
+        x = self.patch_embed(x)  # [B, embed_dim, H/16, W/16]
+        x = x.flatten(2).transpose(1, 2)  # [B, num_patches, embed_dim]
+        
+        # 添加位置嵌入
+        x = x + self.pos_embed
+        x = self.pos_drop(x)
+        
+        # Transformer encoding
+        for block in self.blocks:
+            x = block(x)
+        
+        x = self.norm(x)
+        
+        # Reshape back to spatial
+        grid_size = int(math.sqrt(x.shape[1]))
+        x = x.transpose(1, 2).reshape(B, -1, grid_size, grid_size)
+        
+        # 多尺度特徵融合
+        x = self.aspp(x)
+        
+        # Decoder with task conditioning
+        for stage_blocks in self.decoder_blocks:
+            for block in stage_blocks:
+                x = block(x, task_emb)
+            x = self.upsample(x)
+        
+        # 最終輸出
+        x = self.final_conv(x)
+        
+        # 調整到原始大小
+        if x.shape[2:] != (H, W):
+            x = F.interpolate(x, size=(H, W), mode='bilinear', align_corners=False)
+        
+        return x
+
+
+# ============================================================================
+# Transformer Block (保持原始結構)
+# ============================================================================
+
+class TransformerBlock(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4., dropout=0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim)
+        
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden_dim, dim),
+            nn.Dropout(dropout)
+        )
+    
+    def forward(self, x):
+        # Multi-head attention with residual
+        x = x + self.attn(self.norm1(x), self.norm1(x), self.norm1(x))[0]
+        
+        # MLP with residual
+        x = x + self.mlp(self.norm2(x))
+        
+        return x
+
+
+# ============================================================================
+# 測試和實用函數
+# ============================================================================
+
+def count_parameters(model):
+    """計算模型參數量"""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+def test_model():
+    """測試模型"""
+    print("Testing MultiTaskTransUNet...")
+    
+    model = MultiTaskTransUNet(
+        img_size=400,
+        patch_size=16,
+        num_decoder_layers=80,
+        num_tasks=3
+    )
+    
+    print(f"Total parameters: {count_parameters(model):,}")
+    
+    # 測試不同任務
+    x = torch.randn(2, 3, 400, 400)
+    
+    for task_id, task_name in enumerate(['Plant Cell', 'Blood Cell', 'Root']):
+        print(f"\nTesting {task_name} (task_id={task_id})...")
+        y = model(x, task_id=task_id)
+        print(f"Output shape: {y.shape}")
+        assert y.shape == (2, 1, 400, 400), f"Output shape mismatch: {y.shape}"
+    
+    print("\n✓ All tests passed!")
+
+if __name__ == '__main__':
+    test_model()
+
+
+
+#####inspect_pretrained.py
+"""
+預訓練權重檢查和轉換工具
+
+用途：
+1. 檢查預訓練權重的內容和結構
+2. 檢查哪些層可以載入到新模型
+3. 轉換權重格式（可選）
+"""
+
+import torch
+import sys
+from pathlib import Path
+from collections import OrderedDict
+
+
+def inspect_pretrained_weights(weight_path):
+    """檢查預訓練權重的詳細信息"""
+    print("\n" + "="*80)
+    print(f"檢查預訓練權重: {weight_path}")
+    print("="*80)
+    
+    if not Path(weight_path).exists():
+        print(f"✗ 文件不存在: {weight_path}")
+        return None
+    
+    # 載入權重
+    try:
+        checkpoint = torch.load(weight_path, map_location='cpu')
+    except Exception as e:
+        print(f"✗ 載入失敗: {e}")
+        return None
+    
+    # 檢查格式
+    if isinstance(checkpoint, dict):
+        if 'model_state_dict' in checkpoint:
+            print("✓ 檢測到 checkpoint 格式（包含 optimizer、scheduler 等）")
+            print(f"  Keys: {list(checkpoint.keys())}")
+            
+            if 'epoch' in checkpoint:
+                print(f"  Epoch: {checkpoint['epoch']}")
+            
+            state_dict = checkpoint['model_state_dict']
+        else:
+            print("✓ 檢測到 state_dict 格式（僅模型權重）")
+            state_dict = checkpoint
+    else:
+        print("⚠ 未知格式")
+        return None
+    
+    # 統計信息
+    total_params = len(state_dict)
+    total_size = sum(v.numel() for v in state_dict.values())
+    
+    print(f"\n總參數層數: {total_params}")
+    print(f"總參數量: {total_size:,}")
+    
+    # 按模組分組
+    modules = {}
+    for key in state_dict.keys():
+        module_name = key.split('.')[0]
+        if module_name not in modules:
+            modules[module_name] = []
+        modules[module_name].append(key)
+    
+    print(f"\n模組分佈:")
+    print("-" * 80)
+    for module, keys in sorted(modules.items()):
+        module_params = sum(state_dict[k].numel() for k in keys)
+        print(f"  {module:30s}: {len(keys):3d} 層, {module_params:10,} 參數")
+    
+    # 顯示部分層的詳細信息
+    print(f"\n前 20 層詳細信息:")
+    print("-" * 80)
+    for i, (key, value) in enumerate(list(state_dict.items())[:20]):
+        print(f"  {i+1:2d}. {key:60s} {str(value.shape):20s} ({value.numel():,} params)")
+    
+    if total_params > 20:
+        print(f"  ... (還有 {total_params - 20} 層)")
+    
+    return state_dict
+
+
+def check_compatibility(pretrained_path, current_model_path=None):
+    """檢查預訓練權重與當前模型的兼容性"""
+    print("\n" + "="*80)
+    print("檢查兼容性")
+    print("="*80)
+    
+    # 載入預訓練權重
+    pretrained_dict = inspect_pretrained_weights(pretrained_path)
+    if pretrained_dict is None:
+        return
+    
+    # 如果提供了當前模型，進行對比
+    if current_model_path:
+        print(f"\n載入當前模型進行對比...")
+        try:
+            from model_multitask import MultiTaskTransUNet
+            
+            current_model = MultiTaskTransUNet(
+                img_size=400,
+                patch_size=16,
+                num_decoder_layers=80,
+                num_tasks=3
+            )
+            
+            current_dict = current_model.state_dict()
+            
+            # 統計匹配情況
+            matched = []
+            shape_mismatch = []
+            only_in_pretrained = []
+            only_in_current = []
+            
+            for key in pretrained_dict.keys():
+                if key in current_dict:
+                    if pretrained_dict[key].shape == current_dict[key].shape:
+                        matched.append(key)
+                    else:
+                        shape_mismatch.append((key, pretrained_dict[key].shape, current_dict[key].shape))
+                else:
+                    only_in_pretrained.append(key)
+            
+            for key in current_dict.keys():
+                if key not in pretrained_dict:
+                    only_in_current.append(key)
+            
+            # 顯示結果
+            print(f"\n兼容性分析:")
+            print("-" * 80)
+            print(f"✓ 匹配（可直接載入）:     {len(matched):4d} 層 ({len(matched)/len(current_dict)*100:.1f}%)")
+            print(f"✗ 形狀不匹配（跳過）:     {len(shape_mismatch):4d} 層")
+            print(f"⚠ 僅在預訓練中（忽略）:   {len(only_in_pretrained):4d} 層")
+            print(f"⚠ 僅在當前模型（新初始化）: {len(only_in_current):4d} 層")
+            
+            # 顯示形狀不匹配的層
+            if shape_mismatch:
+                print(f"\n形狀不匹配的層:")
+                for key, pretrained_shape, current_shape in shape_mismatch[:10]:
+                    print(f"  {key:50s} {str(pretrained_shape):20s} → {str(current_shape)}")
+                if len(shape_mismatch) > 10:
+                    print(f"  ... (還有 {len(shape_mismatch) - 10} 層)")
+            
+            # 顯示新初始化的重要層
+            if only_in_current:
+                print(f"\n需要新初始化的重要層:")
+                important = [k for k in only_in_current if any(x in k for x in ['task_embedding', 'aspp', 'attention'])]
+                for key in important[:10]:
+                    print(f"  {key}")
+            
+            # 建議
+            print(f"\n建議:")
+            if len(matched) / len(current_dict) > 0.7:
+                print("  ✓ 兼容性良好！大部分層可以載入。")
+                print("  ✓ 建議使用預訓練權重加速訓練。")
+            elif len(matched) / len(current_dict) > 0.3:
+                print("  ⚠ 兼容性一般。部分層可以載入（主要是 encoder）。")
+                print("  ⚠ 可以使用，但效果可能有限。")
+            else:
+                print("  ✗ 兼容性較差。很少層可以載入。")
+                print("  ✗ 建議從頭訓練。")
+            
+        except ImportError:
+            print("⚠ 無法載入 model_multitask.py，跳過對比")
+        except Exception as e:
+            print(f"✗ 對比失敗: {e}")
+
+
+def extract_encoder_weights(pretrained_path, output_path):
+    """
+    從完整模型中提取 encoder 權重
+    用於只想使用 encoder 部分的情況
+    """
+    print("\n" + "="*80)
+    print("提取 Encoder 權重")
+    print("="*80)
+    
+    checkpoint = torch.load(pretrained_path, map_location='cpu')
+    
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+    else:
+        state_dict = checkpoint
+    
+    # 提取 encoder 相關的層
+    encoder_keys = ['patch_embed', 'pos_embed', 'blocks', 'norm']
+    encoder_dict = OrderedDict()
+    
+    for key, value in state_dict.items():
+        if any(k in key for k in encoder_keys):
+            encoder_dict[key] = value
+    
+    print(f"提取的層數: {len(encoder_dict)} / {len(state_dict)}")
+    print(f"提取的參數量: {sum(v.numel() for v in encoder_dict.values()):,}")
+    
+    # 保存
+    torch.save(encoder_dict, output_path)
+    print(f"\n✓ Encoder 權重已保存到: {output_path}")
+
+
+def convert_to_multitask_format(pretrained_path, output_path):
+    """
+    嘗試將舊模型權重轉換為多任務格式
+    （這主要是一個框架，實際轉換可能需要根據具體情況調整）
+    """
+    print("\n" + "="*80)
+    print("轉換為多任務格式")
+    print("="*80)
+    
+    checkpoint = torch.load(pretrained_path, map_location='cpu')
+    
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+    else:
+        state_dict = checkpoint
+    
+    # 新的 state_dict（只包含兼容的層）
+    new_state_dict = OrderedDict()
+    
+    # 複製兼容的層
+    for key, value in state_dict.items():
+        # 跳過不兼容的層（例如舊的 decoder）
+        if any(skip in key for skip in ['final_conv', 'decoder']):
+            continue
+        new_state_dict[key] = value
+    
+    print(f"保留的層數: {len(new_state_dict)} / {len(state_dict)}")
+    
+    # 保存
+    torch.save(new_state_dict, output_path)
+    print(f"\n✓ 轉換後的權重已保存到: {output_path}")
+
+
+def main():
+    """主函數"""
+    if len(sys.argv) < 2:
+        print("用法:")
+        print("  1. 檢查權重:")
+        print("     python inspect_pretrained.py <weight_path>")
+        print()
+        print("  2. 檢查兼容性:")
+        print("     python inspect_pretrained.py <weight_path> --check-compat")
+        print()
+        print("  3. 提取 encoder:")
+        print("     python inspect_pretrained.py <weight_path> --extract-encoder <output_path>")
+        print()
+        print("  4. 轉換格式:")
+        print("     python inspect_pretrained.py <weight_path> --convert <output_path>")
+        print()
+        print("範例:")
+        print("  python inspect_pretrained.py data/pretrained_model.pth")
+        print("  python inspect_pretrained.py data/pretrained_model.pth --check-compat")
+        return
+    
+    weight_path = sys.argv[1]
+    
+    if not Path(weight_path).exists():
+        print(f"✗ 文件不存在: {weight_path}")
+        return
+    
+    # 執行相應操作
+    if len(sys.argv) == 2:
+        # 只檢查
+        inspect_pretrained_weights(weight_path)
+    
+    elif '--check-compat' in sys.argv:
+        # 檢查兼容性
+        check_compatibility(weight_path, current_model_path=True)
+    
+    elif '--extract-encoder' in sys.argv:
+        # 提取 encoder
+        if len(sys.argv) < 4:
+            print("✗ 請提供輸出路徑")
+            print("   用法: python inspect_pretrained.py <weight_path> --extract-encoder <output_path>")
+            return
+        output_path = sys.argv[3]
+        extract_encoder_weights(weight_path, output_path)
+    
+    elif '--convert' in sys.argv:
+        # 轉換格式
+        if len(sys.argv) < 4:
+            print("✗ 請提供輸出路徑")
+            print("   用法: python inspect_pretrained.py <weight_path> --convert <output_path>")
+            return
+        output_path = sys.argv[3]
+        convert_to_multitask_format(weight_path, output_path)
+    
+    else:
+        print(f"✗ 未知選項: {sys.argv[2]}")
+
+
+if __name__ == '__main__':
+    main()
+
+
+
+#####launch_ui.py
+"""
+快速啟動腳本
+一鍵啟動 Web UI
+"""
+
+import sys
+import subprocess
+
+def check_dependencies():
+    """檢查依賴是否安裝"""
+    required = {
+        'gradio': 'gradio',
+        'torch': 'torch',
+        'cv2': 'opencv-python',
+        'PIL': 'Pillow',
+        'yaml': 'pyyaml'
+    }
+    
+    missing = []
+    
+    for module, package in required.items():
+        try:
+            __import__(module)
+        except ImportError:
+            missing.append(package)
+    
+    return missing
+
+def install_dependencies(packages):
+    """安裝缺失的依賴"""
+    print(f"\n⚠️  偵測到缺少以下套件：")
+    for pkg in packages:
+        print(f"   • {pkg}")
+    
+    response = input("\n是否自動安裝？(y/n): ")
+    
+    if response.lower() == 'y':
+        print("\n📦 安裝中...")
+        for pkg in packages:
+            print(f"\n安裝 {pkg}...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "--break-system-packages"])
+        print("\n✅ 安裝完成！")
+        return True
+    else:
+        print("\n❌ 請手動安裝缺失的套件：")
+        print(f"   pip install {' '.join(packages)}")
+        return False
+
+def main():
+    """主函數"""
+    print("="*60)
+    print("🚀 多任務 TransUNet Web UI 啟動器")
+    print("="*60)
+    
+    # 檢查依賴
+    print("\n📋 檢查依賴...")
+    missing = check_dependencies()
+    
+    if missing:
+        if not install_dependencies(missing):
+            sys.exit(1)
+    else:
+        print("✅ 所有依賴已安裝！")
+    
+    # 啟動 UI
+    print("\n" + "="*60)
+    print("🌐 啟動 Web UI...")
+    print("="*60)
+    
+    try:
+        from app_ui import create_ui
+        
+        app = create_ui()
+        
+        print("\n✅ UI 已啟動！")
+        print("\n📱 瀏覽器訪問：http://localhost:7860")
+        print("   （瀏覽器會自動開啟）")
+        print("\n💡 提示：")
+        print("   • 首次使用需要載入模型")
+        print("   • 按 Ctrl+C 停止服務器")
+        print("\n" + "="*60 + "\n")
+        
+        app.launch(
+            server_name="0.0.0.0",
+            server_port=7860,
+            share=False,
+            inbrowser=True
+        )
+    
+    except Exception as e:
+        print(f"\n❌ 啟動失敗：{e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+
+
+
+#####launch_gui.py
+"""
+一鍵啟動 Tkinter GUI 桌面版
+"""
+
+import sys
+import subprocess
+
+print("="*60)
+print("🚀 多任務 TransUNet - Tkinter 桌面版啟動器")
+print("="*60)
+print("\n檢查依賴...")
+
+# 檢查必要的套件
+required = {
+    'tkinter': 'tkinter (Python 標準庫)',
+    'torch': 'PyTorch',
+    'PIL': 'Pillow',
+    'cv2': 'opencv-python',
+    'numpy': 'numpy',
+    'matplotlib': 'matplotlib'
+}
+
+missing = []
+
+# tkinter 檢查
+try:
+    import tkinter
+    print("   ✅ tkinter")
+except ImportError:
+    missing.append('tkinter (需重新安裝 Python)')
+    print("   ❌ tkinter - 請重新安裝 Python 並確保包含 tkinter")
+
+# 其他套件檢查
+for module, name in list(required.items())[1:]:
+    try:
+        if module == 'cv2':
+            import cv2
+        elif module == 'PIL':
+            from PIL import Image
+        else:
+            __import__(module)
+        print(f"   ✅ {name}")
+    except ImportError:
+        missing.append(name)
+        print(f"   ❌ {name}")
+
+if missing:
+    print(f"\n❌ 缺少以下套件:")
+    for pkg in missing:
+        print(f"   • {pkg}")
+    
+    if 'tkinter' not in [m.split()[0] for m in missing]:
+        print("\n請安裝缺失的套件:")
+        install_list = [m.split()[0] for m in missing if 'tkinter' not in m]
+        if install_list:
+            print(f"   pip install {' '.join(install_list)}")
+    
+    input("\n按 Enter 鍵退出...")
+    sys.exit(1)
+
+print("\n✅ 所有依賴已安裝！")
+print("\n🚀 啟動 GUI...")
+print("="*60 + "\n")
+
+# 啟動 GUI
+try:
+    subprocess.run([sys.executable, 'app_gui.py'])
+except KeyboardInterrupt:
+    print("\n\n👋 感謝使用！")
+except Exception as e:
+    print(f"\n❌ 啟動失敗: {e}")
+    input("\n按 Enter 鍵退出...")
+
+
+
+#####app_gui.py
+"""
+多任務 TransUNet - Tkinter 桌面 GUI 版本
+
+不需要 Gradio，使用 Python 標準庫 tkinter
+適用於所有環境，包括 RTX 5080
+
+功能：
+1. 模型管理
+2. 單張預測
+3. 批量預測
+4. 訓練監控
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+from PIL import Image, ImageTk
+import threading
+import queue
+import os
+from pathlib import Path
+import torch
+import cv2
+import numpy as np
+import json
+import yaml
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from datetime import datetime
+import subprocess
+import sys
+
+# 導入模型
+try:
+    from model_multitask import MultiTaskTransUNet
+    MODEL_AVAILABLE = True
+except ImportError:
+    MODEL_AVAILABLE = False
+    print("Warning: model_multitask.py not found")
+
+# 全局配置
+TASK_MAPPING = {
+    'Cell (植物細胞)': 0,
+    'Blood (血球)': 1,
+    'Root (根系)': 2
+}
+
+TASK_COLORS = {
+    0: 'Blues',
+    1: 'Reds',
+    2: 'Greens'
+}
+
+# 全局變量
+loaded_model = None
+model_device = None
+training_process = None
+training_status = {
+    'is_training': False,
+    'message': '尚未開始訓練'
+}
+
+
+class MultiTaskGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("多任務 TransUNet - 桌面版")
+        self.root.geometry("1200x800")
+        
+        # 設置圖標（如果有）
+        try:
+            self.root.iconbitmap('icon.ico')
+        except:
+            pass
+        
+        # 創建狀態列
+        self.create_status_bar()
+        
+        # 創建主要的標籤頁
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill='both', expand=True, padx=5, pady=5)
+        
+        # 創建各個功能頁面
+        self.create_model_tab()
+        # self.create_training_tab()  # 訓練功能已移至 Gradio 版本
+        self.create_predict_tab()
+        self.create_batch_tab()
+        self.create_monitor_tab()
+        self.create_help_tab()
+        
+        # 更新狀態
+        self.update_status("就緒 - 請先載入模型")
+    
+    def create_status_bar(self):
+        """創建狀態列"""
+        self.status_bar = tk.Label(
+            self.root, 
+            text="就緒", 
+            bd=1, 
+            relief=tk.SUNKEN, 
+            anchor=tk.W
+        )
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+    
+    def update_status(self, message):
+        """更新狀態列"""
+        self.status_bar.config(text=message)
+        self.root.update_idletasks()
+    
+    # ========================================================================
+    # Tab 1: 模型管理
+    # ========================================================================
+    
+    def create_model_tab(self):
+        """創建模型管理頁面"""
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="📦 模型管理")
+        
+        # 標題
+        title = tk.Label(tab, text="模型載入與管理", font=('Arial', 16, 'bold'))
+        title.pack(pady=10)
+        
+        # 模型選擇區域
+        model_frame = ttk.LabelFrame(tab, text="選擇模型", padding=10)
+        model_frame.pack(fill='x', padx=10, pady=5)
+        
+        # 模型路徑
+        path_frame = tk.Frame(model_frame)
+        path_frame.pack(fill='x', pady=5)
+        
+        tk.Label(path_frame, text="模型路徑:").pack(side='left', padx=5)
+        self.model_path_var = tk.StringVar(value="outputs/models/best_model.pth")
+        model_entry = tk.Entry(path_frame, textvariable=self.model_path_var, width=50)
+        model_entry.pack(side='left', padx=5, fill='x', expand=True)
+        
+        tk.Button(
+            path_frame, 
+            text="瀏覽...", 
+            command=self.browse_model
+        ).pack(side='left', padx=5)
+        
+        # 設備選擇
+        device_frame = tk.Frame(model_frame)
+        device_frame.pack(fill='x', pady=5)
+        
+        tk.Label(device_frame, text="計算設備:").pack(side='left', padx=5)
+        self.device_var = tk.StringVar(
+            value="GPU (CUDA)" if torch.cuda.is_available() else "CPU"
+        )
+        
+        ttk.Radiobutton(
+            device_frame, 
+            text="GPU (CUDA)", 
+            variable=self.device_var, 
+            value="GPU (CUDA)"
+        ).pack(side='left', padx=10)
+        
+        ttk.Radiobutton(
+            device_frame, 
+            text="CPU", 
+            variable=self.device_var, 
+            value="CPU"
+        ).pack(side='left', padx=10)
+        
+        # GPU 資訊
+        if torch.cuda.is_available():
+            gpu_info = f"✅ GPU 可用: {torch.cuda.get_device_name(0)}"
+        else:
+            gpu_info = "⚠️ GPU 不可用，將使用 CPU（速度較慢）"
+        
+        tk.Label(device_frame, text=gpu_info, fg='green' if torch.cuda.is_available() else 'orange').pack(side='left', padx=10)
+        
+        # 載入按鈕
+        tk.Button(
+            model_frame, 
+            text="📥 載入模型", 
+            command=self.load_model,
+            bg='#4CAF50',
+            fg='white',
+            font=('Arial', 12, 'bold'),
+            padx=20,
+            pady=10
+        ).pack(pady=10)
+        
+        # 模型資訊顯示
+        info_frame = ttk.LabelFrame(tab, text="模型資訊", padding=10)
+        info_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        self.model_info_text = scrolledtext.ScrolledText(
+            info_frame, 
+            height=15, 
+            wrap=tk.WORD
+        )
+        self.model_info_text.pack(fill='both', expand=True)
+        self.model_info_text.insert('1.0', "尚未載入模型\n\n請選擇模型檔案並點擊「載入模型」按鈕")
+    
+    def browse_model(self):
+        """瀏覽選擇模型檔案"""
+        filename = filedialog.askopenfilename(
+            title="選擇模型檔案",
+            filetypes=[("PyTorch 模型", "*.pth"), ("所有檔案", "*.*")]
+        )
+        if filename:
+            self.model_path_var.set(filename)
+    
+    def load_model(self):
+        """載入模型"""
+        global loaded_model, model_device
+        
+        if not MODEL_AVAILABLE:
+            messagebox.showerror("錯誤", "找不到 model_multitask.py 檔案！")
+            return
+        
+        model_path = self.model_path_var.get()
+        if not os.path.exists(model_path):
+            messagebox.showerror("錯誤", f"模型檔案不存在:\n{model_path}")
+            return
+        
+        self.update_status("正在載入模型...")
+        self.model_info_text.delete('1.0', tk.END)
+        self.model_info_text.insert('1.0', "正在載入模型，請稍候...\n")
+        
+        # 在背景線程載入
+        def load_thread():
+            global loaded_model, model_device  # 重要：在內部函數也要聲明 global
+            try:
+                # 設置設備
+                if self.device_var.get() == "GPU (CUDA)" and torch.cuda.is_available():
+                    device = torch.device('cuda')
+                    device_info = f"GPU: {torch.cuda.get_device_name(0)}"
+                else:
+                    device = torch.device('cpu')
+                    device_info = "CPU"
+                
+                # 創建模型
+                model = MultiTaskTransUNet(
+                    img_size=400,
+                    patch_size=16,
+                    num_decoder_layers=80,
+                    num_tasks=3
+                )
+                
+                # 載入權重
+                checkpoint = torch.load(model_path, map_location=device)
+                
+                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                    model.load_state_dict(checkpoint['model_state_dict'])
+                else:
+                    model.load_state_dict(checkpoint)
+                
+                model.to(device)
+                model.eval()
+                
+                # 更新全局變量
+                loaded_model = model
+                model_device = device
+                
+                # 計算參數量
+                total_params = sum(p.numel() for p in model.parameters())
+                
+                # 更新 UI
+                info = f"""
+✅ 模型載入成功！
+
+📊 模型資訊：
+  • 設備: {device_info}
+  • 參數量: {total_params:,}
+  • 模型路徑: {model_path}
+  • 載入時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+🎯 支援任務：
+  • Cell (植物細胞)
+  • Blood (血球)
+  • Root (根系)
+
+✓ 現在可以開始預測了！
+"""
+                
+                self.root.after(0, lambda: self.model_info_text.delete('1.0', tk.END))
+                self.root.after(0, lambda: self.model_info_text.insert('1.0', info))
+                self.root.after(0, lambda: self.update_status("模型已載入 - 就緒"))
+                self.root.after(0, lambda: messagebox.showinfo("成功", "模型載入成功！"))
+                
+            except Exception as e:
+                error_msg = f"❌ 載入失敗: {str(e)}"
+                self.root.after(0, lambda: self.model_info_text.delete('1.0', tk.END))
+                self.root.after(0, lambda: self.model_info_text.insert('1.0', error_msg))
+                self.root.after(0, lambda: self.update_status("載入失敗"))
+                self.root.after(0, lambda: messagebox.showerror("錯誤", error_msg))
+        
+        threading.Thread(target=load_thread, daemon=True).start()
+    
+    # ========================================================================
+    # Tab 2: 訓練模型
+    # ========================================================================
+    
+    def create_training_tab(self):
+        """創建訓練模型頁面"""
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="🚀 訓練模型")
+        
+        # 標題和說明
+        title = tk.Label(tab, text="訓練新模型或繼續訓練", font=('Arial', 16, 'bold'))
+        title.pack(pady=10)
+        
+        info_label = tk.Label(
+            tab, 
+            text="💡 訓練過程的輸出會顯示在 CMD 視窗，請保持 CMD 視窗開啟",
+            fg='blue'
+        )
+        info_label.pack(pady=5)
+        
+        # 主要內容區
+        main_frame = ttk.Frame(tab)
+        main_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        # 左側：參數設定
+        left_frame = ttk.LabelFrame(main_frame, text="訓練參數", padding=10)
+        left_frame.pack(side='left', fill='both', expand=True, padx=5)
+        
+        # 基本參數
+        basic_frame = ttk.LabelFrame(left_frame, text="基本參數", padding=10)
+        basic_frame.pack(fill='x', pady=5)
+        
+        # Batch Size
+        tk.Label(basic_frame, text="Batch Size:").grid(row=0, column=0, sticky='w', pady=2)
+        self.batch_size_var = tk.IntVar(value=2)
+        batch_spinbox = tk.Spinbox(basic_frame, from_=1, to=16, textvariable=self.batch_size_var, width=10)
+        batch_spinbox.grid(row=0, column=1, sticky='w', padx=5, pady=2)
+        
+        # Epochs
+        tk.Label(basic_frame, text="訓練輪數 (Epochs):").grid(row=1, column=0, sticky='w', pady=2)
+        self.epochs_var = tk.IntVar(value=200)
+        epochs_spinbox = tk.Spinbox(basic_frame, from_=1, to=500, textvariable=self.epochs_var, width=10)
+        epochs_spinbox.grid(row=1, column=1, sticky='w', padx=5, pady=2)
+        
+        # Learning Rate
+        tk.Label(basic_frame, text="學習率 (Learning Rate):").grid(row=2, column=0, sticky='w', pady=2)
+        self.lr_var = tk.StringVar(value="1e-5")
+        lr_entry = tk.Entry(basic_frame, textvariable=self.lr_var, width=15)
+        lr_entry.grid(row=2, column=1, sticky='w', padx=5, pady=2)
+        
+        # Patch Size
+        tk.Label(basic_frame, text="Patch 大小:").grid(row=3, column=0, sticky='w', pady=2)
+        self.patch_size_var = tk.IntVar(value=400)
+        patch_spinbox = tk.Spinbox(basic_frame, from_=128, to=512, increment=32, textvariable=self.patch_size_var, width=10)
+        patch_spinbox.grid(row=3, column=1, sticky='w', padx=5, pady=2)
+        
+        # Decoder Layers
+        tk.Label(basic_frame, text="Decoder 層數:").grid(row=4, column=0, sticky='w', pady=2)
+        self.num_layers_var = tk.IntVar(value=80)
+        layers_spinbox = tk.Spinbox(basic_frame, from_=20, to=120, increment=10, textvariable=self.num_layers_var, width=10)
+        layers_spinbox.grid(row=4, column=1, sticky='w', padx=5, pady=2)
+        
+        # Data Path
+        tk.Label(basic_frame, text="資料路徑:").grid(row=5, column=0, sticky='w', pady=2)
+        self.data_path_var = tk.StringVar(value="data/")
+        data_entry = tk.Entry(basic_frame, textvariable=self.data_path_var, width=30)
+        data_entry.grid(row=5, column=1, sticky='w', padx=5, pady=2)
+        
+        # 資料檢查按鈕
+        tk.Button(
+            basic_frame,
+            text="🔍 檢查資料結構",
+            command=self.check_data_structure,
+            bg='#2196F3',
+            fg='white',
+            font=('Arial', 9, 'bold')
+        ).grid(row=6, column=0, columnspan=2, pady=10)
+        
+        # 進階設定
+        advanced_frame = ttk.LabelFrame(left_frame, text="進階設定", padding=10)
+        advanced_frame.pack(fill='x', pady=5)
+        
+        # 使用預訓練模型
+        self.use_pretrained_var = tk.BooleanVar(value=False)
+        pretrained_check = tk.Checkbutton(
+            advanced_frame,
+            text="使用預訓練模型",
+            variable=self.use_pretrained_var
+        )
+        pretrained_check.pack(anchor='w', pady=5)
+        
+        # 預訓練模型路徑
+        pretrained_frame = tk.Frame(advanced_frame)
+        pretrained_frame.pack(fill='x', pady=5)
+        
+        tk.Label(pretrained_frame, text="預訓練模型:").pack(side='left', padx=5)
+        self.pretrained_path_var = tk.StringVar(value="outputs/models/checkpoint_epoch060.pth")
+        pretrained_entry = tk.Entry(pretrained_frame, textvariable=self.pretrained_path_var, width=25)
+        pretrained_entry.pack(side='left', padx=5, fill='x', expand=True)
+        
+        tk.Button(
+            pretrained_frame,
+            text="瀏覽...",
+            command=self.browse_pretrained_model
+        ).pack(side='left', padx=5)
+        
+        # 右側：控制和狀態
+        right_frame = ttk.LabelFrame(main_frame, text="訓練控制", padding=10)
+        right_frame.pack(side='right', fill='both', expand=True, padx=5)
+        
+        # 控制按鈕
+        button_frame = tk.Frame(right_frame)
+        button_frame.pack(fill='x', pady=5)
+        
+        tk.Button(
+            button_frame,
+            text="🚀 開始訓練",
+            command=self.start_training,
+            bg='#4CAF50',
+            fg='white',
+            font=('Arial', 12, 'bold'),
+            padx=20,
+            pady=10
+        ).pack(side='left', padx=5)
+        
+        tk.Button(
+            button_frame,
+            text="⏹️ 停止訓練",
+            command=self.stop_training,
+            bg='#f44336',
+            fg='white',
+            font=('Arial', 12, 'bold'),
+            padx=20,
+            pady=10
+        ).pack(side='left', padx=5)
+        
+        tk.Button(
+            button_frame,
+            text="🔄 刷新進度",
+            command=self.refresh_training_progress,
+            bg='#FF9800',
+            fg='white',
+            font=('Arial', 10, 'bold'),
+            padx=15,
+            pady=8
+        ).pack(side='left', padx=5)
+        
+        # 訓練進度
+        progress_frame = ttk.LabelFrame(right_frame, text="訓練進度", padding=10)
+        progress_frame.pack(fill='x', pady=5)
+        
+        self.training_progress_bar = ttk.Progressbar(
+            progress_frame,
+            mode='determinate',
+            length=400
+        )
+        self.training_progress_bar.pack(fill='x', pady=5)
+        
+        self.training_progress_label = tk.Label(progress_frame, text="尚未開始訓練")
+        self.training_progress_label.pack(pady=5)
+        
+        # 訓練訊息
+        msg_frame = ttk.LabelFrame(right_frame, text="訓練訊息", padding=10)
+        msg_frame.pack(fill='both', expand=True, pady=5)
+        
+        self.training_msg_text = scrolledtext.ScrolledText(msg_frame, wrap=tk.WORD, height=15)
+        self.training_msg_text.pack(fill='both', expand=True)
+        self.training_msg_text.insert('1.0', "尚未開始訓練\n\n請設定訓練參數後點擊「開始訓練」")
+        
+        # 資料檢查結果（底部）
+        data_frame = ttk.LabelFrame(tab, text="資料檢查結果", padding=10)
+        data_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        self.data_check_text = scrolledtext.ScrolledText(data_frame, wrap=tk.WORD, height=8)
+        self.data_check_text.pack(fill='both', expand=True)
+        self.data_check_text.insert('1.0', "點擊「檢查資料結構」查看資料集資訊")
+        
+        self.training_process = None
+    
+    def browse_pretrained_model(self):
+        """瀏覽選擇預訓練模型"""
+        filename = filedialog.askopenfilename(
+            title="選擇預訓練模型",
+            filetypes=[("PyTorch 模型", "*.pth"), ("所有檔案", "*.*")]
+        )
+        if filename:
+            self.pretrained_path_var.set(filename)
+    
+    def check_data_structure(self):
+        """檢查資料結構"""
+        data_path = Path(self.data_path_var.get())
+        
+        self.data_check_text.delete('1.0', tk.END)
+        self.data_check_text.insert('1.0', "正在檢查資料結構...\n\n")
+        self.update_status("檢查資料中...")
+        
+        def check_thread():
+            try:
+                result = "📁 資料結構檢查\n\n"
+                
+                if not data_path.exists():
+                    result += f"❌ 資料路徑不存在: {data_path}\n"
+                    self.root.after(0, lambda: self.data_check_text.delete('1.0', tk.END))
+                    self.root.after(0, lambda: self.data_check_text.insert('1.0', result))
+                    self.root.after(0, lambda: self.update_status("資料路徑不存在"))
+                    return
+                
+                # 檢查訓練集
+                train_path = data_path / 'train'
+                val_path = data_path / 'val'
+                
+                for split_name, split_path in [('訓練集', train_path), ('驗證集', val_path)]:
+                    result += f"\n{'='*50}\n{split_name}: {split_path}\n{'='*50}\n"
+                    
+                    if not split_path.exists():
+                        result += f"❌ {split_name}目錄不存在\n"
+                        continue
+                    
+                    for task in ['cell', 'blood', 'root']:
+                        task_path = split_path / task
+                        if task_path.exists():
+                            images_path = task_path / 'images'
+                            masks_path = task_path / 'masks'
+                            
+                            num_images = len(list(images_path.glob('*'))) if images_path.exists() else 0
+                            num_masks = len(list(masks_path.glob('*'))) if masks_path.exists() else 0
+                            
+                            if num_images > 0 and num_masks > 0:
+                                result += f"  ✅ {task:10s}: {num_images:3d} 影像, {num_masks:3d} masks\n"
+                            elif num_images > 0:
+                                result += f"  ⚠️  {task:10s}: {num_images:3d} 影像, {num_masks:3d} masks (不匹配！)\n"
+                            else:
+                                result += f"  ❌ {task:10s}: 無資料\n"
+                        else:
+                            result += f"  ❌ {task:10s}: 目錄不存在\n"
+                
+                result += "\n" + "="*50 + "\n"
+                result += "✅ 資料檢查完成！\n"
+                
+                self.root.after(0, lambda: self.data_check_text.delete('1.0', tk.END))
+                self.root.after(0, lambda: self.data_check_text.insert('1.0', result))
+                self.root.after(0, lambda: self.update_status("資料檢查完成"))
+                
+            except Exception as e:
+                error_msg = f"❌ 檢查失敗: {str(e)}"
+                self.root.after(0, lambda: self.data_check_text.delete('1.0', tk.END))
+                self.root.after(0, lambda: self.data_check_text.insert('1.0', error_msg))
+                self.root.after(0, lambda: self.update_status("檢查失敗"))
+        
+        threading.Thread(target=check_thread, daemon=True).start()
+    
+    def start_training(self):
+        """開始訓練"""
+        global training_process, training_status
+        
+        if training_status['is_training']:
+            messagebox.showwarning("警告", "訓練已在進行中！")
+            return
+        
+        self.update_status("準備開始訓練...")
+        self.training_msg_text.delete('1.0', tk.END)
+        self.training_msg_text.insert('1.0', "正在準備訓練...\n\n")
+        
+        def train_thread():
+            try:
+                # 創建配置文件（使用與 Gradio 相同的格式）
+                config = {
+                    'batch_size': int(self.batch_size_var.get()),
+                    'epochs': int(self.epochs_var.get()),
+                    'lr': float(self.lr_var.get()),
+                    'patch_size': int(self.patch_size_var.get()),
+                    'num_decoder_conv_layers': int(self.num_layers_var.get()),  # 注意：是 conv_layers
+                    'data_path': self.data_path_var.get(),
+                    'task_structure': 'subfolder',
+                    'boundary_weights': {0: 2.0, 1: 3.0, 2: 5.0},
+                    'foreground_weights': {0: 1.0, 1: 1.5, 2: 3.0}
+                }
+                
+                # 如果使用預訓練模型
+                if self.use_pretrained_var.get():
+                    pretrained_path = self.pretrained_path_var.get()
+                    if os.path.exists(pretrained_path):
+                        config['pretrained_model_path'] = pretrained_path  # 注意參數名
+                    else:
+                        error_msg = f"❌ 預訓練模型不存在: {pretrained_path}"
+                        self.root.after(0, lambda: messagebox.showerror("錯誤", error_msg))
+                        return
+                
+                # 保存配置文件
+                config_path = Path('config_gui_training.yaml')
+                with open(config_path, 'w', encoding='utf-8') as f:
+                    yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+                
+                # 準備訓練命令（使用配置文件）
+                cmd = [
+                    sys.executable,
+                    'train_multitask.py',
+                    '--config', str(config_path)
+                ]
+                
+                # 更新狀態
+                training_status['is_training'] = True
+                training_status['current_epoch'] = 0
+                training_status['total_epochs'] = self.epochs_var.get()
+                training_status['message'] = '正在啟動訓練...'
+                
+                msg = f"""
+🚀 開始訓練！
+
+📊 訓練配置：
+  • Batch Size: {self.batch_size_var.get()}
+  • Epochs: {self.epochs_var.get()}
+  • Learning Rate: {self.lr_var.get()}
+  • Patch Size: {self.patch_size_var.get()}
+  • Decoder Layers: {self.num_layers_var.get()}
+  • Data Path: {self.data_path_var.get()}
+  • 預訓練模型: {'是' if self.use_pretrained_var.get() else '否'}
+  • 配置文件: {config_path}
+
+💡 訓練過程的詳細輸出會顯示在 CMD 視窗
+   請保持 CMD 視窗開啟以查看進度
+
+🔄 點擊「刷新進度」查看當前訓練狀態
+"""
+                
+                self.root.after(0, lambda: self.training_msg_text.delete('1.0', tk.END))
+                self.root.after(0, lambda: self.training_msg_text.insert('1.0', msg))
+                self.root.after(0, lambda: self.update_status("訓練進行中..."))
+                
+                # 啟動訓練程序
+                # 設置環境變量以支持 UTF-8 編碼（解決 Windows cp950 問題）
+                env = os.environ.copy()
+                env['PYTHONIOENCODING'] = 'utf-8'
+                
+                self.training_process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    universal_newlines=True,
+                    bufsize=1,
+                    env=env  # 使用 UTF-8 環境
+                )
+                
+                print("\n" + "="*60)
+                print("🚀 訓練已啟動！")
+                print("="*60)
+                print(f"命令: {' '.join(cmd)}")
+                print(f"配置文件: {config_path}")
+                print("\n配置內容:")
+                print(yaml.dump(config, default_flow_style=False, allow_unicode=True))
+                print("\n訓練輸出：\n")
+                
+                # 讀取輸出
+                for line in self.training_process.stdout:
+                    print(line, end='')
+                
+                self.training_process.wait()
+                
+                # 訓練結束
+                training_status['is_training'] = False
+                
+                if self.training_process.returncode == 0:
+                    training_status['message'] = '✅ 訓練完成！'
+                    final_msg = "\n\n✅ 訓練成功完成！\n\n模型已保存到 outputs/models/ 目錄"
+                else:
+                    training_status['message'] = '❌ 訓練失敗'
+                    final_msg = f"\n\n❌ 訓練失敗（返回碼: {self.training_process.returncode}）\n請查看 CMD 視窗了解錯誤詳情"
+                
+                self.root.after(0, lambda: self.training_msg_text.insert(tk.END, final_msg))
+                self.root.after(0, lambda: self.update_status("訓練結束"))
+                self.root.after(0, lambda: self.training_progress_bar.config(value=100))
+                
+            except Exception as e:
+                training_status['is_training'] = False
+                training_status['message'] = f'❌ 錯誤: {str(e)}'
+                error_msg = f"\n\n❌ 訓練錯誤: {str(e)}"
+                self.root.after(0, lambda: self.training_msg_text.insert(tk.END, error_msg))
+                self.root.after(0, lambda: self.update_status("訓練失敗"))
+                self.root.after(0, lambda: messagebox.showerror("錯誤", f"訓練失敗: {e}"))
+        
+        threading.Thread(target=train_thread, daemon=True).start()
+    
+    def stop_training(self):
+        """停止訓練"""
+        global training_status
+        
+        if not training_status['is_training']:
+            messagebox.showinfo("提示", "目前沒有正在進行的訓練")
+            return
+        
+        if self.training_process and self.training_process.poll() is None:
+            response = messagebox.askyesno("確認", "確定要停止訓練嗎？\n進度將會丟失。")
+            if response:
+                self.training_process.terminate()
+                training_status['is_training'] = False
+                training_status['message'] = '⏹️ 訓練已停止'
+                
+                self.training_msg_text.insert(tk.END, "\n\n⏹️ 訓練已被用戶停止")
+                self.update_status("訓練已停止")
+    
+    def refresh_training_progress(self):
+        """刷新訓練進度"""
+        global training_status
+        
+        if training_status['is_training']:
+            current = training_status.get('current_epoch', 0)
+            total = training_status.get('total_epochs', 1)
+            progress = (current / total * 100) if total > 0 else 0
+            
+            self.training_progress_bar.config(value=progress)
+            self.training_progress_label.config(
+                text=f"進度: Epoch {current}/{total} ({progress:.1f}%)"
+            )
+        else:
+            self.training_progress_label.config(text=training_status['message'])
+    
+    # ========================================================================
+    # Tab 3: 單張預測
+    # ========================================================================
+    
+    def create_predict_tab(self):
+        """創建單張預測頁面"""
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="🎯 單張預測")
+        
+        # 左側：控制面板
+        left_frame = ttk.Frame(tab)
+        left_frame.pack(side='left', fill='both', padx=5, pady=5)
+        
+        # 上傳影像
+        upload_frame = ttk.LabelFrame(left_frame, text="上傳影像", padding=10)
+        upload_frame.pack(fill='x', pady=5)
+        
+        tk.Button(
+            upload_frame,
+            text="📁 選擇影像檔案",
+            command=self.select_predict_image,
+            bg='#2196F3',
+            fg='white',
+            font=('Arial', 10, 'bold'),
+            padx=15,
+            pady=8
+        ).pack(pady=5)
+        
+        self.predict_image_label = tk.Label(upload_frame, text="未選擇檔案", fg='gray')
+        self.predict_image_label.pack(pady=5)
+        
+        # 預覽影像
+        self.preview_label = tk.Label(upload_frame, text="影像預覽", bg='lightgray', width=40, height=15)
+        self.preview_label.pack(pady=5)
+        
+        # 參數設定
+        param_frame = ttk.LabelFrame(left_frame, text="預測參數", padding=10)
+        param_frame.pack(fill='x', pady=5)
+        
+        # 任務選擇
+        tk.Label(param_frame, text="任務類型:").pack(anchor='w', pady=2)
+        self.task_var = tk.StringVar(value='Cell (植物細胞)')
+        for task in TASK_MAPPING.keys():
+            ttk.Radiobutton(
+                param_frame,
+                text=task,
+                variable=self.task_var,
+                value=task
+            ).pack(anchor='w', padx=20)
+        
+        # 閾值
+        tk.Label(param_frame, text="分割閾值:").pack(anchor='w', pady=(10, 2))
+        self.threshold_var = tk.DoubleVar(value=0.5)
+        threshold_scale = tk.Scale(
+            param_frame,
+            from_=0.0,
+            to=1.0,
+            resolution=0.05,
+            orient='horizontal',
+            variable=self.threshold_var,
+            length=200
+        )
+        threshold_scale.pack(fill='x', padx=10)
+        
+        # 預測按鈕
+        tk.Button(
+            left_frame,
+            text="🔍 開始預測",
+            command=self.predict_single,
+            bg='#4CAF50',
+            fg='white',
+            font=('Arial', 12, 'bold'),
+            padx=20,
+            pady=10
+        ).pack(pady=10)
+        
+        # 右側：結果顯示
+        right_frame = ttk.Frame(tab)
+        right_frame.pack(side='right', fill='both', expand=True, padx=5, pady=5)
+        
+        # 結果顯示區
+        result_notebook = ttk.Notebook(right_frame)
+        result_notebook.pack(fill='both', expand=True)
+        
+        # 熱圖
+        heatmap_frame = ttk.Frame(result_notebook)
+        result_notebook.add(heatmap_frame, text="機率熱圖")
+        self.heatmap_label = tk.Label(heatmap_frame, text="預測結果會顯示在這裡", bg='lightgray')
+        self.heatmap_label.pack(fill='both', expand=True, padx=5, pady=5)
+        
+        # 二值化
+        binary_frame = ttk.Frame(result_notebook)
+        result_notebook.add(binary_frame, text="二值化結果")
+        self.binary_label = tk.Label(binary_frame, text="預測結果會顯示在這裡", bg='lightgray')
+        self.binary_label.pack(fill='both', expand=True, padx=5, pady=5)
+        
+        # 疊加圖
+        overlay_frame = ttk.Frame(result_notebook)
+        result_notebook.add(overlay_frame, text="疊加圖")
+        self.overlay_label = tk.Label(overlay_frame, text="預測結果會顯示在這裡", bg='lightgray')
+        self.overlay_label.pack(fill='both', expand=True, padx=5, pady=5)
+        
+        # 統計資訊
+        stats_frame = ttk.Frame(result_notebook)
+        result_notebook.add(stats_frame, text="統計資訊")
+        self.stats_text = scrolledtext.ScrolledText(stats_frame, wrap=tk.WORD)
+        self.stats_text.pack(fill='both', expand=True, padx=5, pady=5)
+        
+        self.predict_image_path = None
+    
+    def select_predict_image(self):
+        """選擇要預測的影像"""
+        filename = filedialog.askopenfilename(
+            title="選擇影像檔案",
+            filetypes=[
+                ("影像檔案", "*.jpg *.jpeg *.png *.bmp"),
+                ("所有檔案", "*.*")
+            ]
+        )
+        if filename:
+            self.predict_image_path = filename
+            self.predict_image_label.config(text=os.path.basename(filename), fg='black')
+            
+            # 顯示預覽
+            try:
+                img = Image.open(filename)
+                img.thumbnail((300, 300))
+                photo = ImageTk.PhotoImage(img)
+                self.preview_label.config(image=photo, text='')
+                self.preview_label.image = photo
+            except Exception as e:
+                messagebox.showerror("錯誤", f"無法載入影像: {e}")
+    
+    def predict_single(self):
+        """執行單張預測"""
+        global loaded_model, model_device
+        
+        if loaded_model is None:
+            messagebox.showerror("錯誤", "請先載入模型！")
+            return
+        
+        if self.predict_image_path is None:
+            messagebox.showerror("錯誤", "請先選擇影像！")
+            return
+        
+        self.update_status("正在預測...")
+        
+        def predict_thread():
+            global loaded_model, model_device  # 確保訪問全局變量
+            try:
+                # 讀取影像
+                image = Image.open(self.predict_image_path)
+                image_rgb = np.array(image)
+                
+                # 確保是 RGB
+                if len(image_rgb.shape) == 2:
+                    image_rgb = cv2.cvtColor(image_rgb, cv2.COLOR_GRAY2RGB)
+                elif image_rgb.shape[2] == 4:
+                    image_rgb = cv2.cvtColor(image_rgb, cv2.COLOR_RGBA2RGB)
+                
+                h, w = image_rgb.shape[:2]
+                task_id = TASK_MAPPING[self.task_var.get()]
+                threshold = self.threshold_var.get()
+                
+                # 預測
+                result = self.predict_image_full(loaded_model, image_rgb, task_id, model_device)
+                
+                # 二值化
+                pred_binary = (result > threshold).astype(np.uint8) * 255
+                
+                # 創建熱圖
+                heatmap_img = self.create_heatmap_image(result, TASK_COLORS[task_id])
+                
+                # 創建疊加圖
+                overlay_img = self.create_overlay_image(image_rgb, result, threshold)
+                
+                # 統計
+                foreground_ratio = (result > threshold).sum() / result.size * 100
+                stats = f"""
+📊 預測結果：
+
+🎯 任務: {self.task_var.get()}
+📏 影像大小: {w} x {h}
+🎚️ 閾值: {threshold:.2f}
+
+📈 統計：
+  • 最小值: {result.min():.3f}
+  • 最大值: {result.max():.3f}
+  • 平均值: {result.mean():.3f}
+  • 前景比例: {foreground_ratio:.2f}%
+  • 前景像素: {int((result > threshold).sum())} / {result.size}
+
+✅ 預測完成！
+"""
+                
+                # 更新 UI
+                self.root.after(0, lambda: self.display_predict_results(
+                    heatmap_img, pred_binary, overlay_img, stats
+                ))
+                self.root.after(0, lambda: self.update_status("預測完成"))
+                
+            except Exception as e:
+                error_msg = f"預測失敗: {str(e)}"
+                self.root.after(0, lambda: messagebox.showerror("錯誤", error_msg))
+                self.root.after(0, lambda: self.update_status("預測失敗"))
+        
+        threading.Thread(target=predict_thread, daemon=True).start()
+    
+    def predict_image_full(self, model, image, task_id, device, patch_size=400):
+        """完整影像預測"""
+        h, w = image.shape[:2]
+        result = np.zeros((h, w), dtype=np.float32)
+        count = np.zeros((h, w), dtype=np.float32)
+        
+        stride = patch_size // 2
+        
+        with torch.no_grad():
+            for y in range(0, max(1, h - patch_size + 1), stride):
+                for x in range(0, max(1, w - patch_size + 1), stride):
+                    y_end = min(y + patch_size, h)
+                    x_end = min(x + patch_size, w)
+                    y_start = max(0, y_end - patch_size)
+                    x_start = max(0, x_end - patch_size)
+                    
+                    patch = image[y_start:y_end, x_start:x_end]
+                    
+                    if patch.shape[0] < patch_size or patch.shape[1] < patch_size:
+                        patch_padded = np.zeros((patch_size, patch_size, 3), dtype=np.uint8)
+                        patch_padded[:patch.shape[0], :patch.shape[1]] = patch
+                        patch = patch_padded
+                    
+                    patch_tensor = torch.from_numpy(
+                        patch.astype(np.float32) / 255.0
+                    ).permute(2, 0, 1).unsqueeze(0).to(device)
+                    
+                    pred = model(patch_tensor, task_id=task_id)
+                    pred = torch.sigmoid(pred)[0, 0].cpu().numpy()
+                    
+                    actual_h = min(patch.shape[0], y_end - y_start)
+                    actual_w = min(patch.shape[1], x_end - x_start)
+                    result[y_start:y_end, x_start:x_end] += pred[:actual_h, :actual_w]
+                    count[y_start:y_end, x_start:x_end] += 1
+        
+        result = result / (count + 1e-7)
+        return result
+    
+    def create_heatmap_image(self, prob_map, colormap='jet'):
+        """創建熱圖"""
+        fig, ax = plt.subplots(figsize=(8, 8), dpi=80)
+        im = ax.imshow(prob_map, cmap=colormap, vmin=0, vmax=1)
+        ax.axis('off')
+        plt.colorbar(im, ax=ax, fraction=0.046)
+        plt.tight_layout(pad=0)
+        
+        fig.canvas.draw()
+        img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+        img = img.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+        plt.close(fig)
+        
+        return Image.fromarray(img)
+    
+    def create_overlay_image(self, image, prob_map, threshold):
+        """創建疊加圖"""
+        mask = (prob_map > threshold).astype(np.uint8) * 255
+        mask_colored = np.zeros_like(image)
+        mask_colored[:, :, 1] = mask
+        overlay = cv2.addWeighted(image, 0.7, mask_colored, 0.3, 0)
+        return Image.fromarray(overlay)
+    
+    def display_predict_results(self, heatmap_img, binary_img, overlay_img, stats):
+        """顯示預測結果"""
+        # 熱圖
+        heatmap_img.thumbnail((600, 600))
+        heatmap_photo = ImageTk.PhotoImage(heatmap_img)
+        self.heatmap_label.config(image=heatmap_photo, text='')
+        self.heatmap_label.image = heatmap_photo
+        
+        # 二值化
+        binary_pil = Image.fromarray(binary_img)
+        binary_pil.thumbnail((600, 600))
+        binary_photo = ImageTk.PhotoImage(binary_pil)
+        self.binary_label.config(image=binary_photo, text='')
+        self.binary_label.image = binary_photo
+        
+        # 疊加
+        overlay_img.thumbnail((600, 600))
+        overlay_photo = ImageTk.PhotoImage(overlay_img)
+        self.overlay_label.config(image=overlay_photo, text='')
+        self.overlay_label.image = overlay_photo
+        
+        # 統計
+        self.stats_text.delete('1.0', tk.END)
+        self.stats_text.insert('1.0', stats)
+    
+    # ========================================================================
+    # Tab 4: 批量預測
+    # ========================================================================
+    
+    def create_batch_tab(self):
+        """創建批量預測頁面"""
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="📁 批量預測")
+        
+        # 控制面板
+        control_frame = ttk.LabelFrame(tab, text="批量處理", padding=10)
+        control_frame.pack(fill='x', padx=10, pady=5)
+        
+        # 選擇檔案
+        tk.Button(
+            control_frame,
+            text="📁 選擇多個影像",
+            command=self.select_batch_images,
+            bg='#2196F3',
+            fg='white',
+            font=('Arial', 10, 'bold'),
+            padx=15,
+            pady=8
+        ).pack(pady=5)
+        
+        self.batch_files_label = tk.Label(control_frame, text="未選擇檔案", fg='gray')
+        self.batch_files_label.pack(pady=5)
+        
+        # 參數
+        param_frame = tk.Frame(control_frame)
+        param_frame.pack(fill='x', pady=5)
+        
+        tk.Label(param_frame, text="任務:").pack(side='left', padx=5)
+        self.batch_task_var = tk.StringVar(value='Cell (植物細胞)')
+        task_menu = ttk.Combobox(
+            param_frame,
+            textvariable=self.batch_task_var,
+            values=list(TASK_MAPPING.keys()),
+            state='readonly',
+            width=20
+        )
+        task_menu.pack(side='left', padx=5)
+        
+        tk.Label(param_frame, text="閾值:").pack(side='left', padx=5)
+        self.batch_threshold_var = tk.DoubleVar(value=0.5)
+        threshold_scale = tk.Scale(
+            param_frame,
+            from_=0.0,
+            to=1.0,
+            resolution=0.05,
+            orient='horizontal',
+            variable=self.batch_threshold_var,
+            length=200
+        )
+        threshold_scale.pack(side='left', padx=5)
+        
+        # 處理按鈕
+        tk.Button(
+            control_frame,
+            text="🔍 批量預測",
+            command=self.predict_batch,
+            bg='#4CAF50',
+            fg='white',
+            font=('Arial', 12, 'bold'),
+            padx=20,
+            pady=10
+        ).pack(pady=10)
+        
+        # 進度條
+        self.batch_progress = ttk.Progressbar(
+            control_frame,
+            mode='determinate',
+            length=400
+        )
+        self.batch_progress.pack(pady=5)
+        
+        self.batch_progress_label = tk.Label(control_frame, text="")
+        self.batch_progress_label.pack()
+        
+        # 結果顯示
+        result_frame = ttk.LabelFrame(tab, text="處理結果", padding=10)
+        result_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        self.batch_result_text = scrolledtext.ScrolledText(result_frame, wrap=tk.WORD)
+        self.batch_result_text.pack(fill='both', expand=True)
+        
+        self.batch_files = []
+    
+    def select_batch_images(self):
+        """選擇多個影像"""
+        filenames = filedialog.askopenfilenames(
+            title="選擇多個影像檔案",
+            filetypes=[
+                ("影像檔案", "*.jpg *.jpeg *.png *.bmp"),
+                ("所有檔案", "*.*")
+            ]
+        )
+        if filenames:
+            self.batch_files = list(filenames)
+            self.batch_files_label.config(
+                text=f"已選擇 {len(self.batch_files)} 個檔案",
+                fg='black'
+            )
+    
+    def predict_batch(self):
+        """執行批量預測"""
+        global loaded_model, model_device
+        
+        if loaded_model is None:
+            messagebox.showerror("錯誤", "請先載入模型！")
+            return
+        
+        if not self.batch_files:
+            messagebox.showerror("錯誤", "請先選擇影像檔案！")
+            return
+        
+        self.update_status("正在批量處理...")
+        self.batch_result_text.delete('1.0', tk.END)
+        self.batch_result_text.insert('1.0', "開始批量處理...\n\n")
+        
+        def batch_thread():
+            global loaded_model, model_device  # 確保訪問全局變數
+            task_id = TASK_MAPPING[self.batch_task_var.get()]
+            threshold = self.batch_threshold_var.get()
+            total = len(self.batch_files)
+            results = []
+            
+            # 創建輸出目錄
+            output_dir = Path('outputs/batch_predictions')
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 創建時間戳記目錄
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            task_name = self.batch_task_var.get().split()[0]  # Cell, Blood, Root
+            batch_output_dir = output_dir / f"{timestamp}_{task_name}"
+            batch_output_dir.mkdir(exist_ok=True)
+            
+            for idx, filepath in enumerate(self.batch_files):
+                try:
+                    # 更新進度
+                    progress = (idx + 1) / total * 100
+                    self.root.after(0, lambda p=progress, i=idx+1: (
+                        self.batch_progress.config(value=p),
+                        self.batch_progress_label.config(text=f"處理中: {i}/{total}")
+                    ))
+                    
+                    # 讀取和預測
+                    image = Image.open(filepath)
+                    image_rgb = np.array(image)
+                    
+                    if len(image_rgb.shape) == 2:
+                        image_rgb = cv2.cvtColor(image_rgb, cv2.COLOR_GRAY2RGB)
+                    elif image_rgb.shape[2] == 4:
+                        image_rgb = cv2.cvtColor(image_rgb, cv2.COLOR_RGBA2RGB)
+                    
+                    result = self.predict_image_full(loaded_model, image_rgb, task_id, model_device)
+                    foreground_ratio = (result > threshold).sum() / result.size * 100
+                    
+                    # 生成輸出圖片
+                    filename = os.path.basename(filepath)
+                    name_without_ext = os.path.splitext(filename)[0]
+                    
+                    # 1. 保存機率熱圖
+                    heatmap_img = self.create_heatmap_image(result, TASK_COLORS[task_id])
+                    heatmap_path = batch_output_dir / f"{name_without_ext}_heatmap.png"
+                    heatmap_img.save(heatmap_path)
+                    
+                    # 2. 保存二值化結果
+                    pred_binary = (result > threshold).astype(np.uint8) * 255
+                    binary_path = batch_output_dir / f"{name_without_ext}_binary.png"
+                    cv2.imwrite(str(binary_path), pred_binary)
+                    
+                    # 3. 保存疊加圖
+                    overlay_img = self.create_overlay_image(image_rgb, result, threshold)
+                    overlay_path = batch_output_dir / f"{name_without_ext}_overlay.png"
+                    overlay_img.save(overlay_path)
+                    
+                    # 4. 保存原圖（方便對照）
+                    original_path = batch_output_dir / f"{name_without_ext}_original.png"
+                    Image.fromarray(image_rgb).save(original_path)
+                    
+                    msg = f"✓ {filename}: {foreground_ratio:.2f}% (已保存)\n"
+                    self.root.after(0, lambda m=msg: self.batch_result_text.insert(tk.END, m))
+                    
+                    results.append((filename, foreground_ratio))
+                    
+                except Exception as e:
+                    filename = os.path.basename(filepath)
+                    msg = f"✗ {filename}: 失敗 - {str(e)}\n"
+                    self.root.after(0, lambda m=msg: self.batch_result_text.insert(tk.END, m))
+            
+            # 完成
+            avg_ratio = sum(r[1] for r in results) / len(results) if results else 0
+            summary = f"""
+\n{'='*50}
+✅ 批量處理完成！
+
+📊 統計：
+  • 成功處理: {len(results)} / {total}
+  • 平均前景比例: {avg_ratio:.2f}%
+  • 任務: {self.batch_task_var.get()}
+  • 閾值: {threshold:.2f}
+
+💾 輸出位置：
+  {batch_output_dir}
+
+📁 每張影像生成 4 個文件：
+  • *_original.png  - 原始影像
+  • *_heatmap.png   - 機率熱圖
+  • *_binary.png    - 二值化結果
+  • *_overlay.png   - 疊加圖
+"""
+            self.root.after(0, lambda: self.batch_result_text.insert(tk.END, summary))
+            self.root.after(0, lambda: self.update_status("批量處理完成"))
+            
+            # 顯示完成對話框並詢問是否打開資料夾
+            def show_completion():
+                response = messagebox.askyesno(
+                    "完成", 
+                    f"✅ 成功處理 {len(results)}/{total} 個檔案！\n\n"
+                    f"圖片已保存到:\n{batch_output_dir}\n\n"
+                    f"是否打開輸出資料夾？"
+                )
+                if response:
+                    # 打開輸出資料夾
+                    try:
+                        if sys.platform == 'win32':
+                            os.startfile(batch_output_dir)
+                        elif sys.platform == 'darwin':
+                            subprocess.run(['open', batch_output_dir])
+                        else:
+                            subprocess.run(['xdg-open', batch_output_dir])
+                    except Exception as e:
+                        messagebox.showinfo("提示", f"請手動打開資料夾:\n{batch_output_dir}")
+            
+            self.root.after(0, show_completion)
+        
+        threading.Thread(target=batch_thread, daemon=True).start()
+    
+    # ========================================================================
+    # Tab 5: 訓練監控
+    # ========================================================================
+    
+    def create_monitor_tab(self):
+        """創建訓練監控頁面"""
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="📊 訓練監控")
+        
+        # 按鈕區
+        button_frame = tk.Frame(tab)
+        button_frame.pack(fill='x', padx=10, pady=5)
+        
+        tk.Button(
+            button_frame,
+            text="📈 載入訓練曲線",
+            command=self.load_training_history,
+            bg='#2196F3',
+            fg='white',
+            font=('Arial', 10, 'bold'),
+            padx=15,
+            pady=8
+        ).pack(side='left', padx=5)
+        
+        tk.Button(
+            button_frame,
+            text="🖼️ 載入驗證影像",
+            command=self.load_validation_images,
+            bg='#2196F3',
+            fg='white',
+            font=('Arial', 10, 'bold'),
+            padx=15,
+            pady=8
+        ).pack(side='left', padx=5)
+        
+        # 顯示區
+        display_notebook = ttk.Notebook(tab)
+        display_notebook.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        # 訓練曲線
+        curve_frame = ttk.Frame(display_notebook)
+        display_notebook.add(curve_frame, text="訓練曲線")
+        
+        self.curve_label = tk.Label(curve_frame, text="點擊「載入訓練曲線」查看", bg='lightgray')
+        self.curve_label.pack(fill='both', expand=True, padx=5, pady=5)
+        
+        # 統計資訊
+        stats_frame = ttk.Frame(display_notebook)
+        display_notebook.add(stats_frame, text="統計資訊")
+        
+        self.monitor_stats_text = scrolledtext.ScrolledText(stats_frame, wrap=tk.WORD)
+        self.monitor_stats_text.pack(fill='both', expand=True, padx=5, pady=5)
+        
+        # 驗證影像
+        val_frame = ttk.Frame(display_notebook)
+        display_notebook.add(val_frame, text="驗證影像")
+        
+        # 創建可滾動的 Canvas
+        val_canvas = tk.Canvas(val_frame)
+        val_scrollbar = ttk.Scrollbar(val_frame, orient="vertical", command=val_canvas.yview)
+        self.val_images_frame = ttk.Frame(val_canvas)
+        
+        self.val_images_frame.bind(
+            "<Configure>",
+            lambda e: val_canvas.configure(scrollregion=val_canvas.bbox("all"))
+        )
+        
+        val_canvas.create_window((0, 0), window=self.val_images_frame, anchor="nw")
+        val_canvas.configure(yscrollcommand=val_scrollbar.set)
+        
+        val_canvas.pack(side="left", fill="both", expand=True)
+        val_scrollbar.pack(side="right", fill="y")
+    
+    def load_training_history(self):
+        """載入訓練歷史"""
+        history_file = Path('outputs/training_history.json')
+        
+        if not history_file.exists():
+            messagebox.showerror("錯誤", f"找不到訓練歷史檔案:\n{history_file}")
+            return
+        
+        self.update_status("載入訓練歷史...")
+        
+        def load_thread():
+            try:
+                with open(history_file, 'r', encoding='utf-8') as f:
+                    history = json.load(f)
+                
+                # 創建訓練曲線
+                fig, axes = plt.subplots(2, 2, figsize=(12, 8), dpi=100)
+                
+                epochs = list(range(1, len(history['train_loss']) + 1))
+                
+                # Loss
+                axes[0, 0].plot(epochs, history['train_loss'], label='Train', linewidth=2, marker='o')
+                if history.get('val_loss'):
+                    axes[0, 0].plot(epochs[:len(history['val_loss'])], history['val_loss'], 
+                                   label='Val', linewidth=2, marker='s')
+                axes[0, 0].set_xlabel('Epoch')
+                axes[0, 0].set_ylabel('Loss')
+                axes[0, 0].set_title('Training Loss')
+                axes[0, 0].legend()
+                axes[0, 0].grid(True, alpha=0.3)
+                
+                # IoU
+                if history.get('val_iou'):
+                    axes[0, 1].plot(epochs[:len(history['val_iou'])], history['val_iou'], 
+                                   linewidth=2, color='green', marker='o')
+                    axes[0, 1].set_xlabel('Epoch')
+                    axes[0, 1].set_ylabel('IoU')
+                    axes[0, 1].set_title('Validation IoU')
+                    axes[0, 1].grid(True, alpha=0.3)
+                
+                # Dice
+                if history.get('val_dice'):
+                    axes[1, 0].plot(epochs[:len(history['val_dice'])], history['val_dice'], 
+                                   linewidth=2, color='blue', marker='o')
+                    axes[1, 0].set_xlabel('Epoch')
+                    axes[1, 0].set_ylabel('Dice')
+                    axes[1, 0].set_title('Validation Dice')
+                    axes[1, 0].grid(True, alpha=0.3)
+                
+                # Task IoU
+                if history.get('task_metrics'):
+                    for task_id, name in [(0, 'Cell'), (1, 'Blood'), (2, 'Root')]:
+                        if str(task_id) in history['task_metrics']:
+                            metrics = history['task_metrics'][str(task_id)]
+                            if metrics:
+                                ious = [m.get('iou', 0) for m in metrics if 'iou' in m]
+                                if ious:
+                                    axes[1, 1].plot(epochs[:len(ious)], ious, label=name, linewidth=2, marker='o')
+                    axes[1, 1].set_xlabel('Epoch')
+                    axes[1, 1].set_ylabel('IoU')
+                    axes[1, 1].set_title('Task-specific IoU')
+                    axes[1, 1].legend()
+                    axes[1, 1].grid(True, alpha=0.3)
+                
+                plt.tight_layout()
+                
+                # 轉換為圖片
+                fig.canvas.draw()
+                img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+                img = img.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+                plt.close(fig)
+                
+                curve_img = Image.fromarray(img)
+                
+                # 統計
+                best_epoch = np.argmax(history.get('val_iou', [0]))
+                stats = f"""
+📈 訓練歷史統計
+
+🏆 最佳結果（Epoch {best_epoch + 1}）：
+  • Val IoU: {history.get('val_iou', [0])[best_epoch]:.4f}
+  • Val Dice: {history.get('val_dice', [0])[best_epoch]:.4f if history.get('val_dice') else 'N/A'}
+
+📊 最終結果：
+  • Train Loss: {history['train_loss'][-1]:.4f}
+  • Val IoU: {history.get('val_iou', [0])[-1]:.4f if history.get('val_iou') else 'N/A'}
+  
+📉 訓練進度：
+  • 總 Epochs: {len(history['train_loss'])}
+  • Loss 降低: {(1 - history['train_loss'][-1]/history['train_loss'][0])*100:.1f}%
+"""
+                
+                # 更新 UI
+                self.root.after(0, lambda: self.display_training_curve(curve_img, stats))
+                self.root.after(0, lambda: self.update_status("訓練歷史已載入"))
+                
+            except Exception as e:
+                error_msg = f"載入失敗: {str(e)}"
+                self.root.after(0, lambda: messagebox.showerror("錯誤", error_msg))
+                self.root.after(0, lambda: self.update_status("載入失敗"))
+        
+        threading.Thread(target=load_thread, daemon=True).start()
+    
+    def display_training_curve(self, curve_img, stats):
+        """顯示訓練曲線"""
+        curve_img.thumbnail((900, 700))
+        photo = ImageTk.PhotoImage(curve_img)
+        self.curve_label.config(image=photo, text='')
+        self.curve_label.image = photo
+        
+        self.monitor_stats_text.delete('1.0', tk.END)
+        self.monitor_stats_text.insert('1.0', stats)
+    
+    def load_validation_images(self):
+        """載入驗證影像"""
+        pred_dir = Path('outputs/predictions')
+        
+        if not pred_dir.exists():
+            messagebox.showerror("錯誤", f"找不到驗證影像目錄:\n{pred_dir}")
+            return
+        
+        val_images = sorted(pred_dir.glob('val_epoch*.png'))
+        
+        if not val_images:
+            messagebox.showerror("錯誤", "沒有找到驗證影像")
+            return
+        
+        # 清空舊的
+        for widget in self.val_images_frame.winfo_children():
+            widget.destroy()
+        
+        # 顯示最新的 6 張
+        for img_path in val_images[-6:]:
+            try:
+                img = Image.open(img_path)
+                img.thumbnail((800, 400))
+                photo = ImageTk.PhotoImage(img)
+                
+                label = tk.Label(self.val_images_frame, image=photo)
+                label.image = photo
+                label.pack(pady=5)
+                
+                name_label = tk.Label(self.val_images_frame, text=img_path.name)
+                name_label.pack()
+                
+            except Exception as e:
+                print(f"載入失敗: {img_path} - {e}")
+        
+        self.update_status(f"已載入 {min(6, len(val_images))} 張驗證影像")
+    
+    # ========================================================================
+    # Tab 6: 使用說明
+    # ========================================================================
+    
+    def create_help_tab(self):
+        """創建使用說明頁面"""
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="📖 使用說明")
+        
+        help_text = scrolledtext.ScrolledText(tab, wrap=tk.WORD, font=('Arial', 10))
+        help_text.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        help_content = """
+🔬 多任務 TransUNet - 預測專用版
+
+版本: Tkinter GUI v2.0 (預測專用)
+適用: Windows / Linux / Mac
+GPU: 支援 RTX 5080 及所有 NVIDIA GPU
+
+═══════════════════════════════════════════════════════════
+
+⚠️ 重要提示
+
+本版本專注於【模型載入與預測】功能
+訓練功能請使用：python app_train.py (Gradio 訓練介面)
+
+═══════════════════════════════════════════════════════════
+
+📖 快速開始
+
+1️⃣ 載入模型
+   • 前往「模型管理」頁面
+   • 選擇模型檔案（如 outputs/models/best_model.pth）
+   • 選擇計算設備（GPU 推薦）
+   • 點擊「載入模型」
+
+2️⃣ 單張預測
+   • 前往「單張預測」頁面
+   • 選擇影像檔案
+   • 選擇任務類型（Cell/Blood/Root）
+   • 調整閾值
+   • 點擊「開始預測」
+
+3️⃣ 批量處理
+   • 前往「批量預測」頁面
+   • 選擇多個影像
+   • 設定參數
+   • 點擊「批量預測」
+   • 結果自動保存到 outputs/batch_predictions/
+
+4️⃣ 查看訓練結果
+   • 前往「訓練監控」頁面
+   • 載入訓練曲線
+   • 查看驗證影像
+
+═══════════════════════════════════════════════════════════
+
+🎯 任務說明
+
+🌿 Cell (植物細胞)
+   • 適用：植物細胞壁影像
+   • 特點：多邊形結構
+   • 建議閾值：0.5-0.7
+
+🩸 Blood (血球)
+   • 適用：血球細胞影像
+   • 特點：圓形結構
+   • 建議閾值：0.4-0.6
+
+🌱 Root (根系)
+   • 適用：植物根系影像
+   • 特點：線性結構
+   • 建議閾值：0.3-0.5
+
+═══════════════════════════════════════════════════════════
+
+🚀 訓練模型（使用專用介面）
+
+訓練功能已移至專用介面，請執行：
+
+    python app_train.py
+
+這會啟動一個 Web 介面（Gradio），專門用於訓練：
+• 開啟瀏覽器自動顯示訓練介面
+• 設定訓練參數更直觀
+• 訓練狀態監控更方便
+• 避免編碼和相容性問題
+
+準備資料結構：
+  data/
+  ├── train/
+  │   ├── cell/images/ + masks/
+  │   ├── blood/images/ + masks/
+  │   └── root/images/ + masks/
+  └── val/（相同結構）
+
+訓練完成後，回到本介面進行預測！
+
+═══════════════════════════════════════════════════════════
+
+📁 批量預測輸出位置
+
+輸出目錄：
+  outputs/batch_predictions/YYYYMMDD_HHMMSS_TaskName/
+
+每張影像生成 4 個文件：
+  • *_original.png  - 原始影像
+  • *_heatmap.png   - 機率熱圖
+  • *_binary.png    - 二值化結果
+  • *_overlay.png   - 疊加圖
+
+範例：
+  outputs/batch_predictions/20251225_163045_Cell/
+  ├── image1_original.png
+  ├── image1_heatmap.png
+  ├── image1_binary.png
+  └── image1_overlay.png
+
+批量預測完成後會彈出對話框，詢問是否打開輸出資料夾。
+
+═══════════════════════════════════════════════════════════
+
+⚙️ 系統需求
+
+最低配置：
+  • RAM: 8GB
+  • CPU: Intel i5 或同等級
+  • 作業系統: Windows 10 / Ubuntu 18.04 / macOS 10.14
+
+推薦配置：
+  • RAM: 16GB
+  • GPU: NVIDIA RTX 3060 或更高（包括 RTX 5080）
+  • VRAM: 8GB
+  • Python: 3.8 或更高
+
+═══════════════════════════════════════════════════════════
+
+❓ 常見問題
+
+Q: 預測結果全黑？
+A: 降低閾值到 0.3，或檢查模型是否正確載入
+
+Q: GPU 無法使用？
+A: 確認已安裝 CUDA 版本的 PyTorch
+   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+
+Q: 程式運行緩慢？
+A: 使用 GPU 模式，速度可提升 10-50 倍
+
+Q: RTX 5080 支援嗎？
+A: 完全支援！只需確保 PyTorch 版本支援你的 CUDA 版本
+
+Q: 如何訓練模型？
+A: 使用專用訓練介面：python app_train.py
+
+Q: 批量預測的圖片在哪？
+A: outputs/batch_predictions/YYYYMMDD_HHMMSS_TaskName/
+
+═══════════════════════════════════════════════════════════
+
+💡 使用技巧
+
+1. 閾值調整
+   • 根系使用較低閾值 (0.3-0.5)
+   • 細胞使用中等閾值 (0.5-0.7)
+   • 可即時調整觀察效果
+
+2. 批量處理
+   • 一次可處理任意數量影像
+   • 相同類型影像使用相同設定
+   • 結果自動保存，不會覆蓋
+
+3. GPU 使用
+   • 第一次預測可能較慢（初始化）
+   • 後續預測會更快
+   • 關閉其他佔用 GPU 的程式
+
+═══════════════════════════════════════════════════════════
+
+📁 檔案位置
+
+模型：outputs/models/
+  • best_model.pth - 最佳模型
+  • final_model.pth - 最終模型
+  • checkpoint_epoch*.pth - 檢查點
+
+批量預測：outputs/batch_predictions/
+  • YYYYMMDD_HHMMSS_TaskName/ - 每次批量處理的結果
+
+訓練結果：outputs/
+  • training_history.json - 訓練歷史
+  • predictions/ - 驗證影像
+
+═══════════════════════════════════════════════════════════
+
+🔧 故障排除
+
+1. 模組導入錯誤
+   確認所有必要檔案都在同一目錄：
+   • model_multitask.py
+   • dataset_multitask.py
+   • losses_multitask.py
+
+2. 模型載入失敗
+   • 檢查模型檔案是否存在
+   • 確認檔案路徑正確
+   • 嘗試重新下載模型
+
+3. GPU 記憶體不足
+   • 關閉其他佔用 GPU 的程式
+   • 使用 CPU 模式
+   • 處理較小的影像
+
+═══════════════════════════════════════════════════════════
+
+🔗 相關工具
+
+• 訓練介面：python app_train.py
+• 預測介面：python app_gui.py（當前）
+
+═══════════════════════════════════════════════════════════
+
+📞 支援與回饋
+
+如有問題或建議，歡迎回饋！
+
+版本資訊：
+• Tkinter GUI v2.0 - 預測專用
+• 訓練功能：使用 app_train.py
+• 最後更新：2025-12-25
+"""
+        
+        help_text.insert('1.0', help_content)
+        help_text.config(state='disabled')
+
+
+def main():
+    """主程式"""
+    root = tk.Tk()
+    app = MultiTaskGUI(root)
+    
+    print("\n" + "="*60)
+    print("🚀 多任務 TransUNet - Tkinter 桌面版")
+    print("="*60)
+    print("\n✅ GUI 已啟動！")
+    print("💡 提示：")
+    print("   • 不需要 Gradio，使用 Python 標準庫")
+    print("   • 支援所有 GPU，包括 RTX 5080")
+    print("   • 請在 GUI 視窗中操作")
+    print("\n" + "="*60 + "\n")
+    
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    # 創建必要目錄
+    Path('outputs/models').mkdir(parents=True, exist_ok=True)
+    Path('outputs/predictions').mkdir(parents=True, exist_ok=True)
+    
+    main()
+
+
+
+#####app_train.py
+"""
+TransUNet 訓練專用 Web UI (Gradio)
+專注於模型訓練功能
+"""
+
+import gradio as gr
+import subprocess
+import sys
+import yaml
+from pathlib import Path
+import json
+import time
+import os
+
+# 全局變量
+training_process = None
+training_status = {
+    'is_training': False,
+    'current_epoch': 0,
+    'total_epochs': 0,
+    'train_loss': 0.0,
+    'val_loss': 0.0,
+    'val_iou': 0.0,
+    'message': '尚未開始訓練',
+    'log_file': '',
+    'error_message': ''
+}
+
+def start_training(batch_size, epochs, lr, patch_size, num_layers, data_path, 
+                  use_pretrained, pretrained_path):
+    """開始訓練"""
+    global training_process, training_status
+    
+    # 檢查是否已在訓練
+    if training_status['is_training']:
+        return "⚠️ 訓練已在進行中！請等待當前訓練完成或先停止訓練。"
+    
+    try:
+        # 更新配置
+        config = {
+            'batch_size': int(batch_size),
+            'epochs': int(epochs),
+            'lr': float(lr),
+            'patch_size': int(patch_size),
+            'num_decoder_conv_layers': int(num_layers),
+            'data_path': data_path,
+            'task_structure': 'subfolder',
+            'boundary_weights': {0: 2.0, 1: 3.0, 2: 5.0},
+            'foreground_weights': {0: 1.0, 1: 1.5, 2: 3.0}
+        }
+        
+        # 添加預訓練設定
+        if use_pretrained and pretrained_path:
+            config['pretrained_model_path'] = pretrained_path
+        
+        # 保存配置
+        config_path = Path('config_training_ui.yaml')
+        with open(config_path, 'w', encoding='utf-8') as f:
+            yaml.dump(config, f, allow_unicode=True, default_flow_style=False)
+        
+        # 創建訓練日誌檔案
+        log_file = Path('outputs/training_ui.log')
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        # 初始化訓練狀態
+        training_status = {
+            'is_training': True,
+            'current_epoch': 0,
+            'total_epochs': int(epochs),
+            'train_loss': 0.0,
+            'val_loss': 0.0,
+            'val_iou': 0.0,
+            'message': '正在啟動訓練...',
+            'log_file': str(log_file),
+            'error_message': ''
+        }
+        
+        # 在後台線程啟動訓練
+        def run_training():
+            global training_process, training_status
+            
+            try:
+                print("\n" + "="*60)
+                print("🚀 開始訓練...")
+                print("="*60)
+                print(f"配置檔案: {config_path}")
+                print(f"日誌檔案: {log_file}")
+                print(f"Batch Size: {batch_size}")
+                print(f"Epochs: {epochs}")
+                print(f"Learning Rate: {lr}")
+                print("="*60 + "\n")
+                
+                # 啟動訓練進程
+                training_process = subprocess.Popen(
+                    [sys.executable, 'train_multitask.py', '--config', str(config_path)],
+                )
+                
+                training_status['message'] = '✅ 訓練已啟動！請查看 CMD 視窗的訓練輸出。'
+                
+                # 等待訓練完成
+                training_process.wait()
+                
+                # 檢查返回碼
+                if training_process.returncode == 0:
+                    training_status['message'] = '✅ 訓練成功完成！'
+                else:
+                    training_status['message'] = f'❌ 訓練失敗 (返回碼: {training_process.returncode})'
+                
+            except Exception as e:
+                training_status['error_message'] = str(e)
+                training_status['message'] = f'❌ 訓練啟動失敗: {str(e)}'
+                print(f"訓練錯誤: {e}")
+            finally:
+                training_status['is_training'] = False
+                training_process = None
+        
+        # 啟動訓練線程
+        import threading
+        training_thread = threading.Thread(target=run_training, daemon=True)
+        training_thread.start()
+        
+        return f"""
+✅ 訓練已成功啟動！
+
+📊 訓練配置：
+• Batch Size: {batch_size}
+• Epochs: {epochs}
+• Learning Rate: {lr}
+• Patch Size: {patch_size}
+• Decoder Layers: {num_layers}
+• Data Path: {data_path}
+• 預訓練模型: {'是 (' + pretrained_path + ')' if use_pretrained else '否'}
+
+💡 提示：
+• 訓練過程的詳細輸出會顯示在終端機 (CMD/Terminal) 中
+• 請保持終端機視窗開啟以查看訓練進度
+• 模型會自動保存到 outputs/models/ 目錄
+• 訓練歷史會保存到 outputs/training_history.json
+
+🔄 點擊「刷新訓練狀態」查看當前進度
+"""
+        
+    except Exception as e:
+        return f"❌ 錯誤: {str(e)}"
+
+
+def stop_training():
+    """停止訓練"""
+    global training_process, training_status
+    
+    if not training_status['is_training']:
+        return "⚠️ 目前沒有正在進行的訓練。"
+    
+    try:
+        if training_process and training_process.poll() is None:
+            training_process.terminate()
+            training_process.wait(timeout=5)
+            training_status['is_training'] = False
+            training_status['message'] = '⏹️ 訓練已停止'
+            return "✅ 訓練已成功停止。"
+        else:
+            training_status['is_training'] = False
+            return "⚠️ 訓練進程已結束。"
+    except Exception as e:
+        return f"❌ 停止訓練時發生錯誤: {str(e)}"
+
+
+def get_training_status():
+    """獲取訓練狀態"""
+    global training_status
+    
+    if not training_status['is_training']:
+        return training_status['message']
+    
+    # 嘗試讀取訓練歷史
+    history_file = Path('outputs/training_history.json')
+    if history_file.exists():
+        try:
+            with open(history_file, 'r', encoding='utf-8') as f:
+                history = json.load(f)
+            
+            if history and len(history.get('train_loss', [])) > 0:
+                current_epoch = len(history['train_loss'])
+                train_loss = history['train_loss'][-1]
+                val_loss = history['val_loss'][-1]
+                val_iou = history['val_iou'][-1]
+                
+                return f"""
+🔄 訓練進行中...
+
+📊 當前進度：
+• Epoch: {current_epoch}/{training_status['total_epochs']}
+• Train Loss: {train_loss:.4f}
+• Val Loss: {val_loss:.4f}
+• Val IoU: {val_iou:.4f}
+
+💡 提示：訓練詳細輸出在終端機視窗中
+"""
+        except:
+            pass
+    
+    return training_status['message']
+
+
+def check_data_structure(data_path):
+    """檢查資料結構"""
+    try:
+        data_path = Path(data_path)
+        
+        if not data_path.exists():
+            return f"❌ 資料路徑不存在: {data_path}"
+        
+        # 檢查訓練和驗證資料夾
+        train_path = data_path / 'train'
+        val_path = data_path / 'val'
+        
+        if not train_path.exists():
+            return f"❌ 找不到訓練資料夾: {train_path}"
+        if not val_path.exists():
+            return f"❌ 找不到驗證資料夾: {val_path}"
+        
+        # 檢查任務資料夾
+        tasks = ['cell', 'blood', 'root']
+        result = "✅ 資料結構檢查結果：\n\n"
+        
+        for split in ['train', 'val']:
+            split_path = data_path / split
+            result += f"📁 {split}/\n"
+            
+            for task in tasks:
+                task_path = split_path / task
+                if not task_path.exists():
+                    result += f"  ❌ {task}/ - 不存在\n"
+                    continue
+                
+                images_path = task_path / 'images'
+                masks_path = task_path / 'masks'
+                
+                if not images_path.exists():
+                    result += f"  ❌ {task}/images/ - 不存在\n"
+                elif not masks_path.exists():
+                    result += f"  ❌ {task}/masks/ - 不存在\n"
+                else:
+                    num_images = len(list(images_path.glob('*')))
+                    num_masks = len(list(masks_path.glob('*')))
+                    result += f"  ✅ {task}/ - {num_images} 影像, {num_masks} masks\n"
+            
+            result += "\n"
+        
+        return result
+        
+    except Exception as e:
+        return f"❌ 檢查時發生錯誤: {str(e)}"
+
+
+def load_training_curve():
+    """載入訓練曲線"""
+    curve_path = Path('outputs/training_history.png')
+    if curve_path.exists():
+        return str(curve_path)
+    return None
+
+
+def load_validation_image(epoch):
+    """載入驗證影像"""
+    val_image_path = Path(f'outputs/predictions/val_epoch{int(epoch):03d}.png')
+    if val_image_path.exists():
+        return str(val_image_path)
+    return None
+
+
+def get_training_stats():
+    """獲取訓練統計"""
+    history_path = Path('outputs/training_history.json')
+    
+    if not history_path.exists():
+        return "❌ 尚未找到訓練歷史文件\n\n請先完成至少一次訓練。"
+    
+    try:
+        with open(history_path, 'r', encoding='utf-8') as f:
+            history = json.load(f)
+        
+        total_epochs = len(history['train_loss'])
+        
+        if total_epochs == 0:
+            return "❌ 訓練歷史為空"
+        
+        # 計算統計
+        stats = f"""
+📊 訓練統計摘要
+{'='*60}
+
+總訓練 Epochs: {total_epochs}
+
+📈 Loss 變化:
+  初始 Train Loss: {history['train_loss'][0]:.4f}
+  最終 Train Loss: {history['train_loss'][-1]:.4f}
+  降低: {history['train_loss'][0] - history['train_loss'][-1]:.4f}
+  
+  初始 Val Loss: {history['val_loss'][0]:.4f}
+  最終 Val Loss: {history['val_loss'][-1]:.4f}
+  降低: {history['val_loss'][0] - history['val_loss'][-1]:.4f}
+
+📊 IoU 變化:
+  初始 Val IoU: {history['val_iou'][0]:.4f}
+  最終 Val IoU: {history['val_iou'][-1]:.4f}
+  提升: {history['val_iou'][-1] - history['val_iou'][0]:.4f}
+  
+  最佳 Val IoU: {max(history['val_iou']):.4f}
+  最佳 Epoch: {history['val_iou'].index(max(history['val_iou'])) + 1}
+
+📊 Dice 變化:
+  初始 Val Dice: {history['val_dice'][0]:.4f}
+  最終 Val Dice: {history['val_dice'][-1]:.4f}
+  提升: {history['val_dice'][-1] - history['val_dice'][0]:.4f}
+
+{'='*60}
+
+各任務表現 (最終 Epoch):
+"""
+        
+        # 各任務表現
+        task_names = ['Cell', 'Blood', 'Root']
+        for task_id in range(3):
+            if str(task_id) in history['task_metrics']:
+                metrics = history['task_metrics'][str(task_id)]
+                if len(metrics) > 0:
+                    final_metric = metrics[-1]
+                    stats += f"\n{task_names[task_id]}:"
+                    stats += f"\n  IoU: {final_metric['iou']:.4f}"
+                    stats += f"\n  Dice: {final_metric['dice']:.4f}"
+                    stats += f"\n  Precision: {final_metric['precision']:.4f}"
+                    stats += f"\n  Recall: {final_metric['recall']:.4f}\n"
+        
+        return stats
+        
+    except Exception as e:
+        return f"❌ 讀取訓練歷史時發生錯誤: {str(e)}"
+
+
+def refresh_monitoring():
+    """刷新所有監控數據"""
+    curve = load_training_curve()
+    stats = get_training_stats()
+    
+    # 找出最新的驗證影像
+    val_images = list(Path('outputs/predictions').glob('val_epoch*.png'))
+    if val_images:
+        latest_val = max(val_images, key=lambda p: p.stat().st_mtime)
+        # 從檔名提取 epoch 數字
+        epoch_num = int(latest_val.stem.replace('val_epoch', ''))
+        return curve, str(latest_val), epoch_num, stats
+    
+    return curve, None, 0, stats
+
+
+# 創建 Gradio 介面
+with gr.Blocks(title="TransUNet 訓練介面") as demo:
+    
+    gr.Markdown("# 🚀 TransUNet 多任務訓練介面")
+    gr.Markdown("專注於模型訓練功能 | 預測功能請使用 Tkinter GUI (app_gui.py)")
+    
+    with gr.Row():
+        with gr.Column(scale=1):
+            gr.Markdown("## ⚙️ 訓練設定")
+            
+            batch_size = gr.Slider(
+                minimum=1, maximum=16, value=4, step=1,
+                label="Batch Size",
+                info="批次大小，取決於 GPU 記憶體"
+            )
+            
+            epochs = gr.Slider(
+                minimum=1, maximum=500, value=200, step=1,
+                label="Epochs",
+                info="訓練輪數"
+            )
+            
+            lr = gr.Textbox(
+                value="1e-5",
+                label="Learning Rate",
+                info="學習率 (建議: 1e-5 到 1e-4)"
+            )
+            
+            patch_size = gr.Slider(
+                minimum=128, maximum=512, value=400, step=32,
+                label="Patch Size",
+                info="影像大小"
+            )
+            
+            num_layers = gr.Slider(
+                minimum=20, maximum=120, value=80, step=10,
+                label="Decoder Conv Layers",
+                info="Decoder 卷積層數"
+            )
+            
+            data_path = gr.Textbox(
+                value="data/",
+                label="Data Path",
+                info="資料集路徑"
+            )
+            
+            check_data_btn = gr.Button("🔍 檢查資料結構", variant="secondary")
+            data_check_output = gr.Textbox(
+                label="資料檢查結果",
+                lines=10,
+                interactive=False
+            )
+            
+            gr.Markdown("### 預訓練模型（可選）")
+            
+            use_pretrained = gr.Checkbox(
+                label="使用預訓練模型",
+                value=False
+            )
+            
+            pretrained_path = gr.Textbox(
+                value="",
+                label="預訓練模型路徑",
+                placeholder="例如: outputs/models/best_model.pth"
+            )
+        
+        with gr.Column(scale=1):
+            gr.Markdown("## 🎮 訓練控制")
+            
+            with gr.Row():
+                start_btn = gr.Button("🚀 開始訓練", variant="primary", size="lg")
+                stop_btn = gr.Button("⏹️ 停止訓練", variant="stop", size="lg")
+            
+            refresh_btn = gr.Button("🔄 刷新訓練狀態", variant="secondary")
+            
+            training_output = gr.Textbox(
+                label="訓練訊息",
+                lines=15,
+                interactive=False
+            )
+    
+    # 訓練監控標籤頁
+    with gr.Tab("📊 訓練監控"):
+        gr.Markdown("## 📊 訓練結果監控")
+        
+        with gr.Row():
+            with gr.Column():
+                refresh_monitor_btn = gr.Button("🔄 刷新監控", variant="primary")
+                
+                gr.Markdown("### 訓練曲線")
+                training_curve = gr.Image(
+                    label="訓練歷史曲線",
+                    type="filepath"
+                )
+                
+            with gr.Column():
+                gr.Markdown("### 驗證影像")
+                epoch_slider = gr.Slider(
+                    minimum=0,
+                    maximum=200,
+                    value=0,
+                    step=1,
+                    label="選擇 Epoch"
+                )
+                
+                val_image = gr.Image(
+                    label="驗證結果",
+                    type="filepath"
+                )
+        
+        gr.Markdown("### 訓練統計")
+        stats_output = gr.Textbox(
+            label="訓練數據統計",
+            lines=10,
+            interactive=False
+        )
+    
+    # 使用說明
+    with gr.Tab("📖 使用說明"):
+        gr.Markdown("""
+## 📝 使用說明
+
+### 1. 準備資料
+確保資料結構如下：
+```
+data/
+├── train/
+│   ├── cell/
+│   │   ├── images/
+│   │   └── masks/
+│   ├── blood/
+│   │   ├── images/
+│   │   └── masks/
+│   └── root/
+│       ├── images/
+│       └── masks/
+└── val/
+    └── (相同結構)
+```
+
+### 2. 設定參數
+- 調整左側的訓練參數
+- 點擊「檢查資料結構」確認資料正確
+
+### 3. 開始訓練
+- 點擊「開始訓練」
+- 查看終端機視窗的詳細輸出
+- 定期點擊「刷新訓練狀態」查看進度
+
+### 4. 輸出位置
+- 模型: `outputs/models/`
+- 訓練歷史: `outputs/training_history.json`
+- 日誌: `outputs/training_ui.log`
+
+### 💡 提示
+- 訓練過程會在終端機顯示詳細資訊
+- 請保持終端機視窗開啟
+- 可隨時停止訓練
+- 使用預訓練模型可繼續訓練
+
+### 🔗 相關工具
+- **預測和推理**: 使用 `app_gui.py` (Tkinter GUI)
+- **訓練監控**: 查看 `outputs/training_history.json`
+            """)
+    
+    # 事件處理
+    start_btn.click(
+        fn=start_training,
+        inputs=[batch_size, epochs, lr, patch_size, num_layers, data_path, 
+                use_pretrained, pretrained_path],
+        outputs=training_output
+    )
+    
+    stop_btn.click(
+        fn=stop_training,
+        outputs=training_output
+    )
+    
+    refresh_btn.click(
+        fn=get_training_status,
+        outputs=training_output
+    )
+    
+    check_data_btn.click(
+        fn=check_data_structure,
+        inputs=data_path,
+        outputs=data_check_output
+    )
+    
+    # 訓練監控事件
+    refresh_monitor_btn.click(
+        fn=refresh_monitoring,
+        outputs=[training_curve, val_image, epoch_slider, stats_output]
+    )
+    
+    epoch_slider.change(
+        fn=load_validation_image,
+        inputs=epoch_slider,
+        outputs=val_image
+    )
+
+
+if __name__ == "__main__":
+    print("\n" + "="*60)
+    print("🚀 TransUNet 訓練介面")
+    print("="*60)
+    print("專注於模型訓練功能")
+    print("預測功能請使用: python app_gui.py")
+    print("="*60)
+    print("\n正在啟動瀏覽器...")
+    print("如果瀏覽器沒有自動開啟，請手動訪問: http://localhost:7860")
+    print("\n")
+    
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=False,
+        show_error=True,
+        inbrowser=True,  # 自動開啟瀏覽器
+        quiet=False
+    )
+
+
+
+
+#####train_multitask.py
+"""
+多任務 TransUNet 訓練腳本
+"""
+
+import os
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+import yaml
+from pathlib import Path
+import numpy as np
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
+# 假設這些模組都在同一目錄
+try:
+    from model_multitask import MultiTaskTransUNet
+    from dataset_multitask import MultiTaskSegmentationDataset
+    from losses_multitask import MultiTaskLoss, compute_metrics, print_metrics, TaskBalancedSampler
+except ImportError:
+    print("Please ensure model_multitask.py, dataset_multitask.py, and losses_multitask.py are in the same directory")
+    raise
+
+
+class MultiTaskTrainer:
+    """多任務訓練器"""
+    
+    def __init__(self, config_path='configs/default.yaml'):
+        # 載入配置
+        self.config = self._load_config(config_path)
+        
+        # 設置設備
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Using device: {self.device}")
+        
+        if torch.cuda.is_available():
+            print(f"GPU: {torch.cuda.get_device_name(0)}")
+            print(f"CUDA Version: {torch.version.cuda}")
+        
+        # 創建輸出目錄
+        self.output_dir = Path('outputs')
+        self.model_dir = self.output_dir / 'models'
+        self.pred_dir = self.output_dir / 'predictions'
+        self.model_dir.mkdir(parents=True, exist_ok=True)
+        self.pred_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 初始化模型、數據和優化器
+        self._init_model()
+        self._init_data()
+        self._init_optimizer()
+        
+        # 訓練歷史
+        self.history = {
+            'train_loss': [],
+            'val_loss': [],
+            'val_iou': [],
+            'val_dice': [],
+            'task_metrics': {0: [], 1: [], 2: []}  # 各任務的指標
+        }
+    
+    def _load_config(self, config_path):
+        """載入配置檔案"""
+        if not os.path.exists(config_path):
+            print(f"Config file not found: {config_path}")
+            print("Using default configuration...")
+            return self._default_config()
+        
+        # 明確指定 UTF-8 編碼以支援中文註釋（Windows 兼容性）
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+        
+        return config
+    
+    def _default_config(self):
+        """預設配置"""
+        return {
+            'batch_size': 4,
+            'epochs': 200,
+            'lr': 1e-5,
+            'patch_size': 400,
+            'num_decoder_conv_layers': 80,
+            'data_path': 'data/',
+            'val_split': 0.2,
+            'task_structure': 'subfolder',  # or 'filename'
+            # 任務特定的損失權重
+            'base_weights': {0: 1.0, 1: 1.0, 2: 1.0},
+            'boundary_weights': {0: 2.0, 1: 3.0, 2: 5.0},
+            'foreground_weights': {0: 1.0, 1: 1.5, 2: 3.0}
+        }
+    
+    def _init_model(self):
+        """初始化模型"""
+        print("\nInitializing model...")
+        
+        self.model = MultiTaskTransUNet(
+            img_size=self.config['patch_size'],
+            patch_size=16,
+            in_channels=3,
+            num_classes=1,
+            embed_dim=768,
+            depth=12,
+            num_heads=12,
+            mlp_ratio=4,
+            num_decoder_layers=self.config['num_decoder_conv_layers'],
+            num_tasks=3,
+            task_embed_dim=256
+        ).to(self.device)
+        
+        # 計算參數量
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        print(f"Total parameters: {total_params:,}")
+        print(f"Trainable parameters: {trainable_params:,}")
+        
+        # 載入預訓練權重（智能部分載入）
+        self._load_pretrained_weights()
+    
+    def _load_pretrained_weights(self):
+        """
+        智能載入預訓練權重
+        支持三種來源：
+        1. 完整的多任務模型權重（直接載入）
+        2. 原始 TransUNet 權重（部分載入，只載入 encoder）
+        3. ImageNet 預訓練的 ViT 權重（只載入 patch_embed 和 blocks）
+        """
+        # 檢查配置中的預訓練路徑
+        pretrained_path = None
+        
+        # 優先級 1: 配置文件中指定的路徑
+        if 'pretrained_model_path' in self.config and self.config['pretrained_model_path']:
+            pretrained_path = Path(self.config['pretrained_model_path'])
+        
+        # 優先級 2: 預設路徑
+        if pretrained_path is None or not pretrained_path.exists():
+            pretrained_path = Path(self.config['data_path']) / 'pretrained model' / 'pretrained_model.pth'
+        
+        if not pretrained_path.exists():
+            print("No pretrained weights found. Training from scratch.")
+            return
+        
+        print(f"\n{'='*60}")
+        print(f"Loading pretrained weights from: {pretrained_path}")
+        print(f"{'='*60}")
+        
+        try:
+            # 載入預訓練權重
+            pretrained_dict = torch.load(pretrained_path, map_location=self.device)
+            
+            # 如果是完整的 checkpoint（包含 optimizer 等）
+            if isinstance(pretrained_dict, dict) and 'model_state_dict' in pretrained_dict:
+                pretrained_dict = pretrained_dict['model_state_dict']
+                print("Detected checkpoint format (extracting model_state_dict)")
+            
+            model_dict = self.model.state_dict()
+            
+            # 統計載入情況
+            total_params = len(model_dict)
+            matched_params = 0
+            shape_mismatch = 0
+            missing_params = 0
+            
+            # 嘗試完整載入（如果是相同架構）
+            try:
+                self.model.load_state_dict(pretrained_dict, strict=True)
+                print("✓ Full model loaded successfully (same architecture)")
+                return
+            except:
+                print("⚠ Full loading failed. Attempting partial loading...")
+            
+            # 部分載入：只載入形狀匹配的層
+            matched_dict = {}
+            
+            print("\nMatching layers:")
+            for k, v in pretrained_dict.items():
+                if k in model_dict:
+                    if v.shape == model_dict[k].shape:
+                        matched_dict[k] = v
+                        matched_params += 1
+                        # 只顯示重要層
+                        if 'weight' in k and len(v.shape) >= 2:
+                            print(f"  ✓ {k:50s} {str(v.shape):20s}")
+                    else:
+                        shape_mismatch += 1
+                        if 'weight' in k:
+                            print(f"  ✗ {k:50s} shape mismatch: {v.shape} vs {model_dict[k].shape}")
+                else:
+                    missing_params += 1
+            
+            # 更新模型權重
+            model_dict.update(matched_dict)
+            self.model.load_state_dict(model_dict)
+            
+            # 統計報告
+            print(f"\n{'='*60}")
+            print(f"Pretrained Loading Summary:")
+            print(f"{'='*60}")
+            print(f"  Total parameters in current model: {total_params}")
+            print(f"  Matched and loaded:                 {matched_params} ({matched_params/total_params*100:.1f}%)")
+            print(f"  Shape mismatch (skipped):           {shape_mismatch}")
+            print(f"  Not in pretrained (initialized):    {total_params - matched_params}")
+            print(f"{'='*60}")
+            
+            if matched_params > 0:
+                print(f"✓ Partial loading successful!")
+                print(f"  Loaded: encoder layers (ViT blocks)")
+                print(f"  Initialized from scratch: task_embedding, aspp, decoder")
+            else:
+                print("⚠ No matching parameters found. Training from scratch.")
+            
+        except Exception as e:
+            print(f"✗ Error loading pretrained weights: {e}")
+            print("Training from scratch.")
+            import traceback
+            traceback.print_exc()
+    
+    def _init_data(self):
+        """初始化數據載入器"""
+        print("\nInitializing datasets...")
+        
+        # 訓練集
+        self.train_dataset = MultiTaskSegmentationDataset(
+            data_root=self.config['data_path'],
+            mode='train',
+            patch_size=self.config['patch_size'],
+            task_structure=self.config.get('task_structure', 'subfolder')
+        )
+        
+        # 驗證集
+        self.val_dataset = MultiTaskSegmentationDataset(
+            data_root=self.config['data_path'],
+            mode='val',
+            patch_size=self.config['patch_size'],
+            task_structure=self.config.get('task_structure', 'subfolder')
+        )
+        
+        # 使用任務平衡採樣器
+        print("\nUsing task-balanced sampling...")
+        train_sampler = TaskBalancedSampler(
+            self.train_dataset,
+            batch_size=self.config['batch_size'],
+            drop_last=True
+        )
+        
+        # 數據載入器
+        self.train_loader = DataLoader(
+            self.train_dataset,
+            batch_sampler=train_sampler,
+            num_workers=4,
+            pin_memory=True
+        )
+        
+        self.val_loader = DataLoader(
+            self.val_dataset,
+            batch_size=self.config['batch_size'],
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True
+        )
+        
+        print(f"\nTrain batches: {len(self.train_loader)}")
+        print(f"Val batches: {len(self.val_loader)}")
+    
+    def _init_optimizer(self):
+        """初始化優化器和學習率調度器"""
+        self.optimizer = AdamW(
+            self.model.parameters(),
+            lr=self.config['lr'],
+            weight_decay=0.01
+        )
+        
+        # 使用 Cosine Annealing 學習率調度器
+        self.scheduler = CosineAnnealingWarmRestarts(
+            self.optimizer,
+            T_0=20,  # 第一次重啟的週期
+            T_mult=2,  # 每次重啟後週期的倍數
+            eta_min=1e-7
+        )
+        
+        # 初始化損失函數
+        self.criterion = MultiTaskLoss(
+            base_weights=self.config.get('base_weights'),
+            boundary_weights=self.config.get('boundary_weights'),
+            foreground_weights=self.config.get('foreground_weights')
+        )
+    
+    def train_epoch(self, epoch):
+        """訓練一個 epoch"""
+        self.model.train()
+        total_loss = 0.0
+        
+        pbar = tqdm(self.train_loader, desc=f'Epoch {epoch+1}/{self.config["epochs"]}')
+        
+        for batch_idx, (images, masks, task_ids) in enumerate(pbar):
+            images = images.to(self.device)
+            masks = masks.to(self.device)
+            task_ids = task_ids.to(self.device)
+            
+            # 前向傳播
+            self.optimizer.zero_grad()
+            
+            # 批量處理：為每個樣本使用其對應的 task_id
+            batch_size = images.shape[0]
+            outputs = []
+            
+            # 如果 batch 中所有樣本的 task_id 相同，可以批量處理
+            unique_tasks = torch.unique(task_ids)
+            
+            if len(unique_tasks) == 1:
+                # 所有樣本是同一任務，批量處理
+                outputs = self.model(images, task_id=unique_tasks[0].item())
+            else:
+                # 不同任務，分別處理（保持向後兼容）
+                for i in range(batch_size):
+                    out = self.model(images[i:i+1], task_id=task_ids[i].item())
+                    outputs.append(out)
+                outputs = torch.cat(outputs, dim=0)
+            
+            # 計算損失
+            loss = self.criterion(outputs, masks, task_ids)
+            
+            # 反向傳播
+            loss.backward()
+            
+            # 梯度裁剪
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            
+            self.optimizer.step()
+            
+            total_loss += loss.item()
+            
+            # 更新進度條
+            pbar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'lr': f'{self.optimizer.param_groups[0]["lr"]:.2e}'
+            })
+        
+        avg_loss = total_loss / len(self.train_loader)
+        
+        # 更新學習率
+        self.scheduler.step()
+        
+        return avg_loss
+    
+    @torch.no_grad()
+    def validate(self, epoch):
+        """驗證"""
+        self.model.eval()
+        total_loss = 0.0
+        all_metrics = []
+        
+        # 收集每個任務的樣本用於視覺化
+        task_samples = {0: None, 1: None, 2: None}
+        
+        for images, masks, task_ids in tqdm(self.val_loader, desc='Validating'):
+            images = images.to(self.device)
+            masks = masks.to(self.device)
+            task_ids = task_ids.to(self.device)
+            
+            # 前向傳播
+            batch_size = images.shape[0]
+            unique_tasks = torch.unique(task_ids)
+            
+            if len(unique_tasks) == 1:
+                # 所有樣本是同一任務，批量處理
+                outputs = self.model(images, task_id=unique_tasks[0].item())
+            else:
+                # 不同任務，分別處理
+                outputs = []
+                for i in range(batch_size):
+                    out = self.model(images[i:i+1], task_id=task_ids[i].item())
+                    outputs.append(out)
+                outputs = torch.cat(outputs, dim=0)
+            
+            # 計算損失
+            loss = self.criterion(outputs, masks, task_ids)
+            total_loss += loss.item()
+            
+            # 計算指標
+            metrics = compute_metrics(outputs, masks, task_ids)
+            all_metrics.append(metrics)
+            
+            # 收集每個任務的第一個樣本用於視覺化（遍歷所有 batch 直到收集齊）
+            for i in range(batch_size):
+                task_id = task_ids[i].item()
+                if task_samples[task_id] is None:
+                    task_samples[task_id] = {
+                        'image': images[i:i+1].cpu(),
+                        'mask': masks[i:i+1].cpu(),
+                        'pred': outputs[i:i+1].cpu(),
+                        'task_id': task_id
+                    }
+        
+        avg_loss = total_loss / len(self.val_loader)
+        
+        # 聚合所有指標
+        aggregated_metrics = self._aggregate_metrics(all_metrics)
+        
+        # 列印指標
+        print(f"\nValidation Loss: {avg_loss:.4f}")
+        print_metrics(aggregated_metrics)
+        
+        # 保存驗證樣本（從收集的樣本中）
+        if epoch % 10 == 0 or epoch == self.config['epochs'] - 1:
+            self._save_collected_samples(task_samples, epoch)
+        
+        return avg_loss, aggregated_metrics
+    
+    def _aggregate_metrics(self, all_metrics):
+        """聚合多個 batch 的指標"""
+        aggregated = {
+            'overall': {'iou': 0, 'dice': 0, 'precision': 0, 'recall': 0, 'count': 0},
+            0: {'iou': 0, 'dice': 0, 'precision': 0, 'recall': 0, 'count': 0},
+            1: {'iou': 0, 'dice': 0, 'precision': 0, 'recall': 0, 'count': 0},
+            2: {'iou': 0, 'dice': 0, 'precision': 0, 'recall': 0, 'count': 0}
+        }
+        
+        for metrics in all_metrics:
+            for key in aggregated:
+                if metrics[key]['count'] > 0:
+                    for metric in ['iou', 'dice', 'precision', 'recall']:
+                        aggregated[key][metric] += metrics[key][metric] * metrics[key]['count']
+                    aggregated[key]['count'] += metrics[key]['count']
+        
+        # 計算平均值
+        for key in aggregated:
+            if aggregated[key]['count'] > 0:
+                for metric in ['iou', 'dice', 'precision', 'recall']:
+                    aggregated[key][metric] /= aggregated[key]['count']
+        
+        return aggregated
+    
+    def _save_collected_samples(self, task_samples, epoch):
+        """從收集的樣本中保存視覺化（確保顯示所有任務）"""
+        fig, axes = plt.subplots(3, 3, figsize=(15, 15))
+        task_names = {0: 'Cell', 1: 'Blood', 2: 'Root'}
+        
+        for task_id in [0, 1, 2]:
+            sample = task_samples[task_id]
+            
+            if sample is None:
+                # 沒有這個任務的樣本（資料集中確實沒有）
+                for col in range(3):
+                    axes[task_id, col].text(
+                        0.5, 0.5, 
+                        f'⚠ No {task_names[task_id]} samples\nin validation set', 
+                        ha='center', va='center', fontsize=14, color='red',
+                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+                    )
+                    axes[task_id, col].set_xlim(0, 1)
+                    axes[task_id, col].set_ylim(0, 1)
+                    axes[task_id, col].axis('off')
+                
+                axes[task_id, 0].set_title(f'{task_names[task_id]} - Image', fontsize=12, fontweight='bold')
+                axes[task_id, 1].set_title(f'{task_names[task_id]} - Ground Truth', fontsize=12, fontweight='bold')
+                axes[task_id, 2].set_title(f'{task_names[task_id]} - Prediction', fontsize=12, fontweight='bold')
+                continue
+            
+            # 原始影像
+            img = sample['image'][0].permute(1, 2, 0).numpy()
+            axes[task_id, 0].imshow(img)
+            axes[task_id, 0].set_title(f'{task_names[task_id]} - Image', fontsize=12, fontweight='bold')
+            axes[task_id, 0].axis('off')
+            
+            # 真實標籤
+            mask = sample['mask'][0, 0].numpy()
+            axes[task_id, 1].imshow(mask, cmap='gray', vmin=0, vmax=1)
+            axes[task_id, 1].set_title(f'{task_names[task_id]} - Ground Truth', fontsize=12, fontweight='bold')
+            axes[task_id, 1].axis('off')
+            
+            # 預測結果（顯示概率熱圖）
+            pred = torch.sigmoid(sample['pred'][0, 0]).numpy()
+            
+            # 使用 jet colormap 讓預測結果更明顯
+            im = axes[task_id, 2].imshow(pred, cmap='jet', vmin=0, vmax=1)
+            axes[task_id, 2].set_title(
+                f'{task_names[task_id]} - Prediction\n(min: {pred.min():.3f}, max: {pred.max():.3f}, mean: {pred.mean():.3f})', 
+                fontsize=10, fontweight='bold'
+            )
+            axes[task_id, 2].axis('off')
+            
+            # 添加 colorbar
+            cbar = plt.colorbar(im, ax=axes[task_id, 2], fraction=0.046, pad=0.04)
+            cbar.set_label('Probability', rotation=270, labelpad=15)
+        
+        plt.suptitle(f'Validation Results - Epoch {epoch}', fontsize=16, fontweight='bold', y=0.995)
+        plt.tight_layout()
+        plt.savefig(self.pred_dir / f'val_epoch{epoch:03d}.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        print(f"✓ Saved validation visualization to {self.pred_dir / f'val_epoch{epoch:03d}.png'}")
+    
+    def plot_history(self):
+        """繪製訓練歷史"""
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        
+        # 損失曲線
+        axes[0, 0].plot(self.history['train_loss'], label='Train Loss')
+        axes[0, 0].plot(self.history['val_loss'], label='Val Loss')
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].set_ylabel('Loss')
+        axes[0, 0].set_title('Training and Validation Loss')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # IoU 曲線
+        axes[0, 1].plot(self.history['val_iou'], label='Overall IoU')
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('IoU')
+        axes[0, 1].set_title('Validation IoU')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # Dice 曲線
+        axes[1, 0].plot(self.history['val_dice'], label='Overall Dice')
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('Dice')
+        axes[1, 0].set_title('Validation Dice')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # 各任務 IoU
+        task_names = {0: 'Cell', 1: 'Blood', 2: 'Root'}
+        for task_id in [0, 1, 2]:
+            if len(self.history['task_metrics'][task_id]) > 0:
+                task_ious = [m['iou'] for m in self.history['task_metrics'][task_id]]
+                axes[1, 1].plot(task_ious, label=f'{task_names[task_id]} IoU')
+        
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('IoU')
+        axes[1, 1].set_title('Task-specific IoU')
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(self.output_dir / 'training_history.png', dpi=150, bbox_inches='tight')
+        plt.close()
+    
+    def train(self):
+        """主訓練循環"""
+        print(f"\n{'='*60}")
+        print("Starting Multi-Task Training")
+        print(f"{'='*60}\n")
+        
+        best_val_iou = 0.0
+        
+        for epoch in range(self.config['epochs']):
+            # 訓練
+            train_loss = self.train_epoch(epoch)
+            self.history['train_loss'].append(train_loss)
+            
+            # 驗證
+            val_loss, val_metrics = self.validate(epoch)
+            self.history['val_loss'].append(val_loss)
+            self.history['val_iou'].append(val_metrics['overall']['iou'])
+            self.history['val_dice'].append(val_metrics['overall']['dice'])
+            
+            # 記錄各任務指標
+            for task_id in [0, 1, 2]:
+                self.history['task_metrics'][task_id].append(val_metrics[task_id])
+            
+            # 保存最佳模型
+            if val_metrics['overall']['iou'] > best_val_iou:
+                best_val_iou = val_metrics['overall']['iou']
+                torch.save(
+                    self.model.state_dict(),
+                    self.model_dir / 'best_model.pth'
+                )
+                print(f"✓ Best model saved (IoU: {best_val_iou:.4f})")
+            
+            # 定期保存檢查點
+            if (epoch + 1) % 20 == 0:
+                torch.save(
+                    {
+                        'epoch': epoch,
+                        'model_state_dict': self.model.state_dict(),
+                        'optimizer_state_dict': self.optimizer.state_dict(),
+                        'scheduler_state_dict': self.scheduler.state_dict(),
+                        'history': self.history
+                    },
+                    self.model_dir / f'checkpoint_epoch{epoch+1:03d}.pth'
+                )
+            
+            # 繪製訓練歷史
+            if (epoch + 1) % 10 == 0:
+                self.plot_history()
+        
+        # 保存最終模型
+        torch.save(
+            self.model.state_dict(),
+            self.model_dir / 'final_model.pth'
+        )
+        
+        # 最終繪圖
+        self.plot_history()
+        
+        # 保存訓練歷史為 JSON
+        print(f"\n{'='*60}")
+        print("Saving training history...")
+        history_json_path = self.output_dir / 'training_history.json'
+        try:
+            import json
+            # 將 numpy 數組轉換為列表以便 JSON 序列化
+            history_to_save = {
+                'train_loss': [float(x) for x in self.history['train_loss']],
+                'val_loss': [float(x) for x in self.history['val_loss']],
+                'val_iou': [float(x) for x in self.history['val_iou']],
+                'val_dice': [float(x) for x in self.history['val_dice']],
+                'task_metrics': {}
+            }
+            
+            # 保存各任務的指標
+            for task_id, metrics_list in self.history['task_metrics'].items():
+                history_to_save['task_metrics'][task_id] = [
+                    {k: float(v) for k, v in m.items()}
+                    for m in metrics_list
+                ]
+            
+            with open(history_json_path, 'w', encoding='utf-8') as f:
+                json.dump(history_to_save, f, indent=2, ensure_ascii=False)
+            
+            print(f"✓ Training history saved to: {history_json_path}")
+            print(f"  - Train Loss: {len(history_to_save['train_loss'])} epochs")
+            print(f"  - Val IoU: {len(history_to_save['val_iou'])} epochs")
+            print(f"  - Task Metrics: {len(history_to_save['task_metrics'])} tasks")
+        except Exception as e:
+            print(f"⚠ Warning: Failed to save training history as JSON: {e}")
+        print(f"{'='*60}")
+        
+        print(f"\n{'='*60}")
+        print("Training Completed!")
+        print(f"Best Validation IoU: {best_val_iou:.4f}")
+        print(f"{'='*60}\n")
+
+
+# ============================================================================
+# 主程式
+# ============================================================================
+
+def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Train Multi-Task TransUNet')
+    parser.add_argument('--config', type=str, default='configs/default.yaml',
+                       help='Path to config file')
+    
+    args = parser.parse_args()
+    
+    # 創建訓練器
+    trainer = MultiTaskTrainer(config_path=args.config)
+    
+    # 開始訓練
+    trainer.train()
+
+
+if __name__ == '__main__':
+    main()
+
+
+
+#####config_training_ui.yaml
+batch_size: 4
+boundary_weights:
+  0: 2.0
+  1: 3.0
+  2: 5.0
+data_path: data/
+epochs: 200
+foreground_weights:
+  0: 1.0
+  1: 1.5
+  2: 3.0
+lr: 1.0e-05
+num_decoder_conv_layers: 80
+patch_size: 400
+pretrained_model_path: outputs/models/final_model.pth
+task_structure: subfolder

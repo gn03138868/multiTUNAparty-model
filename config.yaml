@@ -1,0 +1,114 @@
+# ============================================================================
+# Multi-Task TransUNet Configuration
+# For: Artificial Intelligence in Agriculture
+# ============================================================================
+
+# Model Architecture
+model:
+  name: "MultiTaskTransUNet"
+  img_size: 400
+  patch_size: 16
+  in_channels: 3
+  num_classes: 1
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  mlp_ratio: 4
+  num_tasks: 3
+  dropout: 0.1
+
+# Data Configuration
+data:
+  root: "data/"
+  train_dir: "data/train/"
+  val_dir: "data/val/"
+  patch_size: 400
+  num_workers: 0  # Windows 建議設為 0
+
+# Task Configuration
+tasks:
+  - name: "cell"
+    id: 0
+    description: "Plant cell segmentation"
+  - name: "blood"
+    id: 1
+    description: "Blood cell segmentation"
+  - name: "root"
+    id: 2
+    description: "Fine root segmentation"
+
+# Training Configuration
+training:
+  epochs: 200
+  batch_size: 4
+  learning_rate: 1.0e-5
+  weight_decay: 1.0e-2
+  
+  # Optimizer
+  optimizer: "AdamW"
+  betas: [0.9, 0.999]
+  
+  # Scheduler
+  scheduler: "ReduceLROnPlateau"
+  scheduler_patience: 10
+  scheduler_factor: 0.5
+  min_lr: 1.0e-7
+  
+  # Early Stopping
+  early_stopping: true
+  early_stopping_patience: 30
+  
+  # Mixed Precision
+  use_amp: true
+  
+  # Gradient Clipping
+  gradient_clip: 1.0
+
+# Loss Configuration
+loss:
+  # Base loss weights
+  dice_weight: 1.0
+  bce_weight: 1.0
+  
+  # Task-specific loss weights [base, boundary, foreground]
+  task_weights:
+    cell: [1.0, 2.0, 1.0]
+    blood: [1.0, 3.0, 1.5]
+    root: [1.0, 5.0, 3.0]
+
+# Data Augmentation
+augmentation:
+  enabled: true
+  horizontal_flip: 0.5
+  vertical_flip: 0.5
+  rotation_limit: 45
+  brightness_limit: 0.2
+  contrast_limit: 0.2
+  blur_limit: 3
+  noise_std_range: [0.04, 0.12]
+
+# Output Configuration
+output:
+  dir: "outputs/"
+  save_best: true
+  save_frequency: 10  # Save checkpoint every N epochs
+  log_frequency: 1    # Print log every N epochs
+  
+  # Visualization
+  visualize: true
+  visualize_frequency: 10  # Save validation images every N epochs
+
+# Pretrained Weights (optional)
+pretrained:
+  use_pretrained: false
+  weights_path: null  # Path to pretrained weights if available
+
+# Reproducibility
+seed: 42
+deterministic: false  # Set to true for reproducibility (slower)
+
+# Logging
+logging:
+  level: "INFO"
+  save_log: true
+  log_file: "outputs/training.log"
