@@ -12,4 +12,5 @@ foreground_weights:
 lr: 1.0e-05
 num_decoder_conv_layers: 80
 patch_size: 400
+pretrained_model_path: outputs/models/final_model.pth
 task_structure: subfolder
