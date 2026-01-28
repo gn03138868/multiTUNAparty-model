@@ -1,0 +1,136 @@
+# =============================================================================
+# 多任務 TransUNet 配置檔案範例
+# 支援 2、3 或更多任務
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 範例 1: 3 個任務（預設配置）
+# -----------------------------------------------------------------------------
+# batch_size: 4
+# epochs: 200
+# lr: 1e-5
+# patch_size: 400
+# num_decoder_conv_layers: 80
+# data_path: 'data/'
+# task_structure: 'subfolder'
+# 
+# # 任務配置
+# num_tasks: 3
+# task_names:
+#   0: 'Cell'
+#   1: 'Blood'
+#   2: 'Root'
+# 
+# # 損失權重
+# base_weights:
+#   0: 1.0
+#   1: 1.0
+#   2: 1.0
+# boundary_weights:
+#   0: 2.0
+#   1: 3.0
+#   2: 20.0
+# foreground_weights:
+#   0: 1.0
+#   1: 1.5
+#   2: 15.0
+
+# -----------------------------------------------------------------------------
+# 範例 2: 2 個任務
+# -----------------------------------------------------------------------------
+# batch_size: 4
+# epochs: 200
+# lr: 1e-5
+# patch_size: 400
+# num_decoder_conv_layers: 80
+# data_path: 'data/'
+# task_structure: 'subfolder'
+# 
+# # 只有 2 個任務
+# num_tasks: 2
+# task_names:
+#   0: 'Cell'
+#   1: 'Blood'
+# 
+# # 只需要定義 2 個任務的權重
+# base_weights:
+#   0: 1.0
+#   1: 1.0
+# boundary_weights:
+#   0: 2.0
+#   1: 3.0
+# foreground_weights:
+#   0: 1.0
+#   1: 1.5
+
+# -----------------------------------------------------------------------------
+# 範例 3: 4 個或更多任務
+# -----------------------------------------------------------------------------
+# batch_size: 4
+# epochs: 200
+# lr: 1e-5
+# patch_size: 400
+# num_decoder_conv_layers: 80
+# data_path: 'data/'
+# task_structure: 'subfolder'
+# 
+# # 4 個任務
+# num_tasks: 4
+# task_names:
+#   0: 'Cell'
+#   1: 'Blood'
+#   2: 'Root'
+#   3: 'Leaf'
+# 
+# # 每個任務的權重
+# base_weights:
+#   0: 1.0
+#   1: 1.0
+#   2: 1.0
+#   3: 1.0
+# boundary_weights:
+#   0: 2.0
+#   1: 3.0
+#   2: 20.0
+#   3: 5.0
+# foreground_weights:
+#   0: 1.0
+#   1: 1.5
+#   2: 15.0
+#   3: 2.0
+
+# =============================================================================
+# 當前使用的配置（3 個任務）
+# =============================================================================
+
+batch_size: 4
+epochs: 200
+lr: 1e-5
+patch_size: 400
+num_decoder_conv_layers: 80
+data_path: 'data/'
+task_structure: 'subfolder'
+
+# 任務配置
+num_tasks: 3
+task_names:
+  0: 'Cell'
+  1: 'Blood'
+  2: 'Root'
+
+# 損失權重
+base_weights:
+  0: 1.0
+  1: 1.0
+  2: 1.0
+boundary_weights:
+  0: 2.0
+  1: 3.0
+  2: 20.0
+foreground_weights:
+  0: 1.0
+  1: 1.5
+  2: 15.0
+
+# 預訓練模型路徑（可選）
+# pretrained_model_path: 'outputs/models/checkpoint_epoch100.pth'

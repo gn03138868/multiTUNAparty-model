@@ -1,5 +1,6 @@
 """
 多任務 TransUNet 訓練腳本
+支援 2、3 或更多任務的靈活訓練
 """
 
 import os
@@ -13,6 +14,7 @@ from pathlib import Path
 import numpy as np
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+import json
 
 # 假設這些模組都在同一目錄
 try:
@@ -25,7 +27,10 @@ except ImportError:
 
 
 class MultiTaskTrainer:
-    """多任務訓練器"""
+    """
+    多任務訓練器
+    支援靈活的任務數量（2、3 或更多）
+    """
     
     def __init__(self, config_path='configs/default.yaml'):
         # 載入配置
@@ -39,6 +44,29 @@ class MultiTaskTrainer:
             print(f"GPU: {torch.cuda.get_device_name(0)}")
             print(f"CUDA Version: {torch.version.cuda}")
         
+        # 從配置獲取任務數量和名稱
+        self.num_tasks = self.config.get('num_tasks', 3)
+        self.task_names = self.config.get('task_names', None)
+        
+        # 如果沒有指定任務名稱，使用預設
+        if self.task_names is None:
+            if self.num_tasks == 3:
+                self.task_names = {0: 'Cell', 1: 'Blood', 2: 'Root'}
+            elif self.num_tasks == 2:
+                self.task_names = {0: 'Task_0', 1: 'Task_1'}
+            else:
+                self.task_names = {i: f'Task_{i}' for i in range(self.num_tasks)}
+        
+        # 如果 task_names 是列表，轉換為字典
+        if isinstance(self.task_names, list):
+            self.task_names = {i: name for i, name in enumerate(self.task_names)}
+        
+        print(f"\n{'='*60}")
+        print(f"Training Configuration:")
+        print(f"  Number of tasks: {self.num_tasks}")
+        print(f"  Task names: {self.task_names}")
+        print(f"{'='*60}")
+        
         # 創建輸出目錄
         self.output_dir = Path('outputs')
         self.model_dir = self.output_dir / 'models'
@@ -46,19 +74,19 @@ class MultiTaskTrainer:
         self.model_dir.mkdir(parents=True, exist_ok=True)
         self.pred_dir.mkdir(parents=True, exist_ok=True)
         
-        # 初始化模型、數據和優化器
-        self._init_model()
-        self._init_data()
-        self._init_optimizer()
-        
-        # 訓練歷史
+        # 先初始化訓練歷史（在 _init_data 之前，因為 _init_data 可能會更新 num_tasks）
         self.history = {
             'train_loss': [],
             'val_loss': [],
             'val_iou': [],
             'val_dice': [],
-            'task_metrics': {0: [], 1: [], 2: []}  # 各任務的指標
+            'task_metrics': {i: [] for i in range(self.num_tasks)}
         }
+        
+        # 初始化模型、數據和優化器
+        self._init_model()
+        self._init_data()
+        self._init_optimizer()
     
     def _load_config(self, config_path):
         """載入配置檔案"""
@@ -84,11 +112,33 @@ class MultiTaskTrainer:
             'data_path': 'data/',
             'val_split': 0.2,
             'task_structure': 'subfolder',  # or 'filename'
+            # 任務數量（可設為 2, 3 或更多）
+            'num_tasks': 3,
+            'task_names': {0: 'Cell', 1: 'Blood', 2: 'Root'},
             # 任務特定的損失權重
             'base_weights': {0: 1.0, 1: 1.0, 2: 1.0},
             'boundary_weights': {0: 2.0, 1: 3.0, 2: 20.0},
             'foreground_weights': {0: 1.0, 1: 1.5, 2: 15.0}
         }
+    
+    def _extend_weights(self, weights, num_tasks):
+        """
+        擴展權重字典以覆蓋所有任務
+        如果配置的權重數量少於任務數量，使用平均值填充
+        """
+        if weights is None:
+            return {i: 1.0 for i in range(num_tasks)}
+        
+        # 將字符串鍵轉換為整數
+        weights = {int(k): v for k, v in weights.items()}
+        
+        # 計算預設權重（使用現有權重的平均值）
+        default_weight = 1.0
+        if len(weights) > 0:
+            default_weight = sum(weights.values()) / len(weights)
+        
+        # 擴展到所有任務
+        return {i: weights.get(i, default_weight) for i in range(num_tasks)}
     
     def _init_model(self):
         """初始化模型"""
@@ -104,7 +154,7 @@ class MultiTaskTrainer:
             num_heads=12,
             mlp_ratio=4,
             num_decoder_layers=self.config['num_decoder_conv_layers'],
-            num_tasks=3,
+            num_tasks=self.num_tasks,  # 使用動態任務數量
             task_embed_dim=256
         ).to(self.device)
         
@@ -159,7 +209,6 @@ class MultiTaskTrainer:
             total_params = len(model_dict)
             matched_params = 0
             shape_mismatch = 0
-            missing_params = 0
             
             # 嘗試完整載入（如果是相同架構）
             try:
@@ -185,8 +234,6 @@ class MultiTaskTrainer:
                         shape_mismatch += 1
                         if 'weight' in k:
                             print(f"  ✗ {k:50s} shape mismatch: {v.shape} vs {model_dict[k].shape}")
-                else:
-                    missing_params += 1
             
             # 更新模型權重
             model_dict.update(matched_dict)
@@ -235,6 +282,43 @@ class MultiTaskTrainer:
             task_structure=self.config.get('task_structure', 'subfolder')
         )
         
+        # 自動偵測實際任務數量（跨整個資料集抽樣）
+        detected_tasks = set()
+        dataset_len = len(self.train_dataset)
+        
+        # 從整個資料集均勻抽樣，而不是只看前 100 個
+        sample_indices = np.linspace(0, dataset_len - 1, min(500, dataset_len), dtype=int)
+        
+        for i in sample_indices:
+            try:
+                sample = self.train_dataset[i]
+                if len(sample) >= 3:
+                    task_id = sample[2]
+                    if isinstance(task_id, torch.Tensor):
+                        task_id = task_id.item()
+                    elif isinstance(task_id, np.ndarray):
+                        task_id = int(task_id)
+                    detected_tasks.add(int(task_id))
+            except Exception as e:
+                pass
+        
+        if len(detected_tasks) > 0:
+            actual_num_tasks = max(detected_tasks) + 1
+            print(f"\n  Detected tasks in dataset: {sorted(detected_tasks)}")
+            
+            # 只有當偵測到的任務數量與配置不同時才更新
+            if actual_num_tasks != self.num_tasks:
+                print(f"⚠ Detected {actual_num_tasks} tasks in dataset, config specified {self.num_tasks}")
+                # 使用較大的值，確保不會漏掉任務
+                self.num_tasks = max(actual_num_tasks, self.num_tasks)
+                print(f"  Using: {self.num_tasks} tasks")
+                # 更新 history
+                self.history['task_metrics'] = {i: [] for i in range(self.num_tasks)}
+                # 更新 task_names
+                for i in range(self.num_tasks):
+                    if i not in self.task_names:
+                        self.task_names[i] = f'Task_{i}'
+        
         # 使用任務平衡採樣器
         print("\nUsing task-balanced sampling...")
         train_sampler = TaskBalancedSampler(
@@ -278,12 +362,36 @@ class MultiTaskTrainer:
             eta_min=1e-7
         )
         
+        # 擴展權重以覆蓋所有任務
+        base_weights = self._extend_weights(self.config.get('base_weights'), self.num_tasks)
+        boundary_weights = self._extend_weights(self.config.get('boundary_weights'), self.num_tasks)
+        foreground_weights = self._extend_weights(self.config.get('foreground_weights'), self.num_tasks)
+        
         # 初始化損失函數
         self.criterion = MultiTaskLoss(
-            base_weights=self.config.get('base_weights'),
-            boundary_weights=self.config.get('boundary_weights'),
-            foreground_weights=self.config.get('foreground_weights')
+            base_weights=base_weights,
+            boundary_weights=boundary_weights,
+            foreground_weights=foreground_weights
         )
+    
+    def _unpack_batch(self, batch):
+        """
+        靈活解包 batch 數據
+        支援 Dataset 返回 3 個值 (images, masks, task_ids) 
+        或 4 個值 (images, masks, task_ids, image_names) 的情況
+        """
+        if len(batch) == 3:
+            images, masks, task_ids = batch
+            return images, masks, task_ids
+        elif len(batch) == 4:
+            images, masks, task_ids, _ = batch  # 忽略 image_names
+            return images, masks, task_ids
+        elif len(batch) >= 5:
+            # 處理更多返回值的情況
+            images, masks, task_ids = batch[0], batch[1], batch[2]
+            return images, masks, task_ids
+        else:
+            raise ValueError(f"Unexpected batch format with {len(batch)} elements")
     
     def train_epoch(self, epoch):
         """訓練一個 epoch"""
@@ -292,7 +400,10 @@ class MultiTaskTrainer:
         
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch+1}/{self.config["epochs"]}')
         
-        for batch_idx, (images, masks, task_ids) in enumerate(pbar):
+        for batch_idx, batch in enumerate(pbar):
+            # 靈活解包 batch
+            images, masks, task_ids = self._unpack_batch(batch)
+            
             images = images.to(self.device)
             masks = masks.to(self.device)
             task_ids = task_ids.to(self.device)
@@ -350,10 +461,13 @@ class MultiTaskTrainer:
         total_loss = 0.0
         all_metrics = []
         
-        # 收集每個任務的樣本用於視覺化
-        task_samples = {0: None, 1: None, 2: None}
+        # 收集每個任務的樣本用於視覺化（動態任務數量）
+        task_samples = {i: None for i in range(self.num_tasks)}
         
-        for images, masks, task_ids in tqdm(self.val_loader, desc='Validating'):
+        for batch in tqdm(self.val_loader, desc='Validating'):
+            # 靈活解包 batch
+            images, masks, task_ids = self._unpack_batch(batch)
+            
             images = images.to(self.device)
             masks = masks.to(self.device)
             task_ids = task_ids.to(self.device)
@@ -381,10 +495,10 @@ class MultiTaskTrainer:
             metrics = compute_metrics(outputs, masks, task_ids)
             all_metrics.append(metrics)
             
-            # 收集每個任務的第一個樣本用於視覺化（遍歷所有 batch 直到收集齊）
+            # 收集每個任務的第一個樣本用於視覺化
             for i in range(batch_size):
                 task_id = task_ids[i].item()
-                if task_samples[task_id] is None:
+                if task_id < self.num_tasks and task_samples.get(task_id) is None:
                     task_samples[task_id] = {
                         'image': images[i:i+1].cpu(),
                         'mask': masks[i:i+1].cpu(),
@@ -408,17 +522,17 @@ class MultiTaskTrainer:
         return avg_loss, aggregated_metrics
     
     def _aggregate_metrics(self, all_metrics):
-        """聚合多個 batch 的指標"""
+        """聚合多個 batch 的指標（動態任務數量）"""
         aggregated = {
-            'overall': {'iou': 0, 'dice': 0, 'precision': 0, 'recall': 0, 'count': 0},
-            0: {'iou': 0, 'dice': 0, 'precision': 0, 'recall': 0, 'count': 0},
-            1: {'iou': 0, 'dice': 0, 'precision': 0, 'recall': 0, 'count': 0},
-            2: {'iou': 0, 'dice': 0, 'precision': 0, 'recall': 0, 'count': 0}
+            'overall': {'iou': 0, 'dice': 0, 'precision': 0, 'recall': 0, 'count': 0}
         }
+        # 動態添加各任務
+        for i in range(self.num_tasks):
+            aggregated[i] = {'iou': 0, 'dice': 0, 'precision': 0, 'recall': 0, 'count': 0}
         
         for metrics in all_metrics:
             for key in aggregated:
-                if metrics[key]['count'] > 0:
+                if key in metrics and metrics[key]['count'] > 0:
                     for metric in ['iou', 'dice', 'precision', 'recall']:
                         aggregated[key][metric] += metrics[key][metric] * metrics[key]['count']
                     aggregated[key]['count'] += metrics[key]['count']
@@ -432,19 +546,27 @@ class MultiTaskTrainer:
         return aggregated
     
     def _save_collected_samples(self, task_samples, epoch):
-        """從收集的樣本中保存視覺化（確保顯示所有任務）"""
-        fig, axes = plt.subplots(3, 3, figsize=(15, 15))
-        task_names = {0: 'Cell', 1: 'Blood', 2: 'Root'}
+        """從收集的樣本中保存視覺化（動態任務數量）"""
+        # 根據任務數量動態設置子圖
+        nrows = self.num_tasks
+        ncols = 3
         
-        for task_id in [0, 1, 2]:
-            sample = task_samples[task_id]
+        fig, axes = plt.subplots(nrows, ncols, figsize=(15, 5 * nrows))
+        
+        # 如果只有一個任務，確保 axes 是 2D
+        if nrows == 1:
+            axes = axes.reshape(1, -1)
+        
+        for task_id in range(self.num_tasks):
+            task_name = self.task_names.get(task_id, f'Task_{task_id}')
+            sample = task_samples.get(task_id)
             
             if sample is None:
                 # 沒有這個任務的樣本（資料集中確實沒有）
                 for col in range(3):
                     axes[task_id, col].text(
                         0.5, 0.5, 
-                        f'⚠ No {task_names[task_id]} samples\nin validation set', 
+                        f'⚠ No {task_name} samples\nin validation set', 
                         ha='center', va='center', fontsize=14, color='red',
                         bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5)
                     )
@@ -452,21 +574,21 @@ class MultiTaskTrainer:
                     axes[task_id, col].set_ylim(0, 1)
                     axes[task_id, col].axis('off')
                 
-                axes[task_id, 0].set_title(f'{task_names[task_id]} - Image', fontsize=12, fontweight='bold')
-                axes[task_id, 1].set_title(f'{task_names[task_id]} - Ground Truth', fontsize=12, fontweight='bold')
-                axes[task_id, 2].set_title(f'{task_names[task_id]} - Prediction', fontsize=12, fontweight='bold')
+                axes[task_id, 0].set_title(f'{task_name} - Image', fontsize=12, fontweight='bold')
+                axes[task_id, 1].set_title(f'{task_name} - Ground Truth', fontsize=12, fontweight='bold')
+                axes[task_id, 2].set_title(f'{task_name} - Prediction', fontsize=12, fontweight='bold')
                 continue
             
             # 原始影像
             img = sample['image'][0].permute(1, 2, 0).numpy()
             axes[task_id, 0].imshow(img)
-            axes[task_id, 0].set_title(f'{task_names[task_id]} - Image', fontsize=12, fontweight='bold')
+            axes[task_id, 0].set_title(f'{task_name} - Image', fontsize=12, fontweight='bold')
             axes[task_id, 0].axis('off')
             
             # 真實標籤
             mask = sample['mask'][0, 0].numpy()
             axes[task_id, 1].imshow(mask, cmap='gray', vmin=0, vmax=1)
-            axes[task_id, 1].set_title(f'{task_names[task_id]} - Ground Truth', fontsize=12, fontweight='bold')
+            axes[task_id, 1].set_title(f'{task_name} - Ground Truth', fontsize=12, fontweight='bold')
             axes[task_id, 1].axis('off')
             
             # 預測結果（顯示概率熱圖）
@@ -475,7 +597,7 @@ class MultiTaskTrainer:
             # 使用 jet colormap 讓預測結果更明顯
             im = axes[task_id, 2].imshow(pred, cmap='jet', vmin=0, vmax=1)
             axes[task_id, 2].set_title(
-                f'{task_names[task_id]} - Prediction\n(min: {pred.min():.3f}, max: {pred.max():.3f}, mean: {pred.mean():.3f})', 
+                f'{task_name} - Prediction\n(min: {pred.min():.3f}, max: {pred.max():.3f}, mean: {pred.mean():.3f})', 
                 fontsize=10, fontweight='bold'
             )
             axes[task_id, 2].axis('off')
@@ -492,7 +614,7 @@ class MultiTaskTrainer:
         print(f"✓ Saved validation visualization to {self.pred_dir / f'val_epoch{epoch:03d}.png'}")
     
     def plot_history(self):
-        """繪製訓練歷史"""
+        """繪製訓練歷史（動態任務數量）"""
         fig, axes = plt.subplots(2, 2, figsize=(15, 10))
         
         # 損失曲線
@@ -520,12 +642,12 @@ class MultiTaskTrainer:
         axes[1, 0].legend()
         axes[1, 0].grid(True, alpha=0.3)
         
-        # 各任務 IoU
-        task_names = {0: 'Cell', 1: 'Blood', 2: 'Root'}
-        for task_id in [0, 1, 2]:
+        # 各任務 IoU（動態任務數量）
+        for task_id in range(self.num_tasks):
+            task_name = self.task_names.get(task_id, f'Task_{task_id}')
             if len(self.history['task_metrics'][task_id]) > 0:
                 task_ious = [m['iou'] for m in self.history['task_metrics'][task_id]]
-                axes[1, 1].plot(task_ious, label=f'{task_names[task_id]} IoU')
+                axes[1, 1].plot(task_ious, label=f'{task_name} IoU')
         
         axes[1, 1].set_xlabel('Epoch')
         axes[1, 1].set_ylabel('IoU')
@@ -540,7 +662,7 @@ class MultiTaskTrainer:
     def train(self):
         """主訓練循環"""
         print(f"\n{'='*60}")
-        print("Starting Multi-Task Training")
+        print(f"Starting Multi-Task Training ({self.num_tasks} tasks)")
         print(f"{'='*60}\n")
         
         best_val_iou = 0.0
@@ -556,9 +678,15 @@ class MultiTaskTrainer:
             self.history['val_iou'].append(val_metrics['overall']['iou'])
             self.history['val_dice'].append(val_metrics['overall']['dice'])
             
-            # 記錄各任務指標
-            for task_id in [0, 1, 2]:
-                self.history['task_metrics'][task_id].append(val_metrics[task_id])
+            # 記錄各任務指標（動態任務數量）
+            for task_id in range(self.num_tasks):
+                if task_id in val_metrics:
+                    self.history['task_metrics'][task_id].append(val_metrics[task_id])
+                else:
+                    # 如果沒有這個任務的樣本，添加佔位符
+                    self.history['task_metrics'][task_id].append({
+                        'iou': 0, 'dice': 0, 'precision': 0, 'recall': 0
+                    })
             
             # 保存最佳模型
             if val_metrics['overall']['iou'] > best_val_iou:
@@ -577,7 +705,9 @@ class MultiTaskTrainer:
                         'model_state_dict': self.model.state_dict(),
                         'optimizer_state_dict': self.optimizer.state_dict(),
                         'scheduler_state_dict': self.scheduler.state_dict(),
-                        'history': self.history
+                        'history': self.history,
+                        'num_tasks': self.num_tasks,
+                        'task_names': self.task_names
                     },
                     self.model_dir / f'checkpoint_epoch{epoch+1:03d}.pth'
                 )
@@ -598,21 +728,33 @@ class MultiTaskTrainer:
         # 保存訓練歷史為 JSON
         print(f"\n{'='*60}")
         print("Saving training history...")
+        self._save_history_json()
+        print(f"{'='*60}")
+        
+        print(f"\n{'='*60}")
+        print("Training Completed!")
+        print(f"Number of tasks: {self.num_tasks}")
+        print(f"Best Validation IoU: {best_val_iou:.4f}")
+        print(f"{'='*60}\n")
+    
+    def _save_history_json(self):
+        """保存訓練歷史為 JSON"""
         history_json_path = self.output_dir / 'training_history.json'
         try:
-            import json
             # 將 numpy 數組轉換為列表以便 JSON 序列化
             history_to_save = {
                 'train_loss': [float(x) for x in self.history['train_loss']],
                 'val_loss': [float(x) for x in self.history['val_loss']],
                 'val_iou': [float(x) for x in self.history['val_iou']],
                 'val_dice': [float(x) for x in self.history['val_dice']],
-                'task_metrics': {}
+                'task_metrics': {},
+                'num_tasks': self.num_tasks,
+                'task_names': self.task_names
             }
             
             # 保存各任務的指標
             for task_id, metrics_list in self.history['task_metrics'].items():
-                history_to_save['task_metrics'][task_id] = [
+                history_to_save['task_metrics'][str(task_id)] = [
                     {k: float(v) for k, v in m.items()}
                     for m in metrics_list
                 ]
@@ -623,15 +765,9 @@ class MultiTaskTrainer:
             print(f"✓ Training history saved to: {history_json_path}")
             print(f"  - Train Loss: {len(history_to_save['train_loss'])} epochs")
             print(f"  - Val IoU: {len(history_to_save['val_iou'])} epochs")
-            print(f"  - Task Metrics: {len(history_to_save['task_metrics'])} tasks")
+            print(f"  - Task Metrics: {self.num_tasks} tasks")
         except Exception as e:
             print(f"⚠ Warning: Failed to save training history as JSON: {e}")
-        print(f"{'='*60}")
-        
-        print(f"\n{'='*60}")
-        print("Training Completed!")
-        print(f"Best Validation IoU: {best_val_iou:.4f}")
-        print(f"{'='*60}\n")
 
 
 # ============================================================================

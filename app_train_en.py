@@ -219,15 +219,23 @@ def check_data_structure(data_path):
         if not val_path.exists():
             return f"❌ Validation folder not found: {val_path}"
         
-        # Check task folders
-        tasks = ['cell', 'blood', 'root']
-        result = "✅ Data Structure Check Results:\n\n"
+        # Detect available task folders
+        available_tasks = []
+        for task_folder in train_path.iterdir():
+            if task_folder.is_dir():
+                available_tasks.append(task_folder.name)
+        
+        if not available_tasks:
+            return f"❌ No task folders found in {train_path}"
+        
+        result = f"✅ Data Structure Check Results:\n\n"
+        result += f"📋 Detected {len(available_tasks)} tasks: {', '.join(available_tasks)}\n\n"
         
         for split in ['train', 'val']:
             split_path = data_path / split
             result += f"📁 {split}/\n"
             
-            for task in tasks:
+            for task in available_tasks:
                 task_path = split_path / task
                 if not task_path.exists():
                     result += f"  ❌ {task}/ - Does not exist\n"
@@ -263,14 +271,18 @@ def load_training_curve():
 
 def load_validation_image(epoch):
     """Load validation image"""
-    val_image_path = Path(f'outputs/predictions/val_epoch{int(epoch):03d}.png')
-    if val_image_path.exists():
-        return str(val_image_path)
+    try:
+        epoch = int(epoch)
+        val_image_path = Path(f'outputs/predictions/val_epoch{epoch:03d}.png')
+        if val_image_path.exists():
+            return str(val_image_path)
+    except:
+        pass
     return None
 
 
 def get_training_stats():
-    """Get training statistics"""
+    """Get training statistics (supports dynamic number of tasks)"""
     history_path = Path('outputs/training_history.json')
     
     if not history_path.exists():
@@ -280,57 +292,100 @@ def get_training_stats():
         with open(history_path, 'r', encoding='utf-8') as f:
             history = json.load(f)
         
-        total_epochs = len(history['train_loss'])
+        # Debug: show available keys
+        available_keys = list(history.keys()) if isinstance(history, dict) else "Not a dict"
+        
+        # Handle different possible formats
+        train_loss = history.get('train_loss', history.get('loss', []))
+        val_loss = history.get('val_loss', history.get('validation_loss', []))
+        val_iou = history.get('val_iou', history.get('iou', []))
+        val_dice = history.get('val_dice', history.get('dice', []))
+        
+        total_epochs = len(train_loss) if train_loss else 0
         
         if total_epochs == 0:
-            return "❌ Training history is empty"
+            return f"❌ Training history is empty or has unexpected format\n\nAvailable keys: {available_keys}"
         
-        # Calculate statistics
+        # Calculate statistics with safe access
         stats = f"""
 {'='*60}
 TRAINING STATISTICS
 {'='*60}
 
 Total Epochs: {total_epochs}
-
+"""
+        
+        # Loss progression (with safety checks)
+        if train_loss and len(train_loss) > 0:
+            stats += f"""
 📉 Loss Progression:
-  Initial Train Loss: {history['train_loss'][0]:.4f}
-  Final Train Loss:   {history['train_loss'][-1]:.4f}
-  Initial Val Loss:   {history['val_loss'][0]:.4f}
-  Final Val Loss:     {history['val_loss'][-1]:.4f}
-
+  Initial Train Loss: {train_loss[0]:.4f}
+  Final Train Loss:   {train_loss[-1]:.4f}"""
+        
+        if val_loss and len(val_loss) > 0:
+            stats += f"""
+  Initial Val Loss:   {val_loss[0]:.4f}
+  Final Val Loss:     {val_loss[-1]:.4f}
+"""
+        
+        # IoU progression
+        if val_iou and len(val_iou) > 0:
+            stats += f"""
 📈 IoU Progression:
-  Initial Val IoU: {history['val_iou'][0]:.4f}
-  Final Val IoU:   {history['val_iou'][-1]:.4f}
-  Improvement:     {history['val_iou'][-1] - history['val_iou'][0]:.4f}
-
+  Initial Val IoU: {val_iou[0]:.4f}
+  Final Val IoU:   {val_iou[-1]:.4f}
+  Improvement:     {val_iou[-1] - val_iou[0]:.4f}
+"""
+        
+        # Dice progression
+        if val_dice and len(val_dice) > 0:
+            stats += f"""
 📊 Dice Progression:
-  Initial Val Dice: {history['val_dice'][0]:.4f}
-  Final Val Dice:   {history['val_dice'][-1]:.4f}
-  Improvement:      {history['val_dice'][-1] - history['val_dice'][0]:.4f}
-
+  Initial Val Dice: {val_dice[0]:.4f}
+  Final Val Dice:   {val_dice[-1]:.4f}
+  Improvement:      {val_dice[-1] - val_dice[0]:.4f}
+"""
+        
+        stats += f"""
 {'='*60}
 
 Per-Task Performance (Final Epoch):
 """
         
-        # Per-task performance
-        task_names = ['Cell', 'Blood', 'Root']
-        for task_id in range(3):
-            if str(task_id) in history['task_metrics']:
-                metrics = history['task_metrics'][str(task_id)]
-                if len(metrics) > 0:
+        # Get task names from history (if available) or use defaults
+        task_names = history.get('task_names', {})
+        if not task_names:
+            task_names = {'0': 'Cell', '1': 'Blood', '2': 'Root'}
+        
+        # Convert keys to strings if needed
+        if isinstance(task_names, dict):
+            task_names = {str(k): v for k, v in task_names.items()}
+        
+        # Per-task performance (dynamic)
+        task_metrics = history.get('task_metrics', {})
+        
+        if task_metrics:
+            for task_id_str, metrics in task_metrics.items():
+                task_name = task_names.get(str(task_id_str), f'Task_{task_id_str}')
+                if metrics and len(metrics) > 0:
                     final_metric = metrics[-1]
-                    stats += f"\n{task_names[task_id]}:"
-                    stats += f"\n  IoU: {final_metric['iou']:.4f}"
-                    stats += f"\n  Dice: {final_metric['dice']:.4f}"
-                    stats += f"\n  Precision: {final_metric['precision']:.4f}"
-                    stats += f"\n  Recall: {final_metric['recall']:.4f}\n"
+                    if isinstance(final_metric, dict):
+                        stats += f"\n{task_name}:"
+                        stats += f"\n  IoU: {final_metric.get('iou', 0):.4f}"
+                        stats += f"\n  Dice: {final_metric.get('dice', 0):.4f}"
+                        stats += f"\n  Precision: {final_metric.get('precision', 0):.4f}"
+                        stats += f"\n  Recall: {final_metric.get('recall', 0):.4f}\n"
+        else:
+            stats += "\n(No per-task metrics available)"
         
         return stats
         
+    except json.JSONDecodeError as e:
+        return f"❌ Invalid JSON format in training history: {str(e)}"
     except Exception as e:
-        return f"❌ Error reading training history: {str(e)}"
+        # More detailed error info
+        import traceback
+        return f"❌ Error reading training history: {str(e)}\n\nType: {type(e).__name__}\n\nTraceback:\n{traceback.format_exc()}"
 
 
 def refresh_monitoring():
@@ -338,8 +393,16 @@ def refresh_monitoring():
     curve = load_training_curve()
     stats = get_training_stats()
     
+    # Check if predictions directory exists
+    predictions_dir = Path('outputs/predictions')
+    if not predictions_dir.exists():
+        return curve, None, gr.update(maximum=200, value=0), stats
+    
     # Find all available validation images
-    val_images = sorted(list(Path('outputs/predictions').glob('val_epoch*.png')))
+    try:
+        val_images = sorted(list(predictions_dir.glob('val_epoch*.png')))
+    except Exception as e:
+        return curve, None, gr.update(maximum=200, value=0), stats
     
     if val_images:
         # Extract all epoch numbers
@@ -357,16 +420,13 @@ def refresh_monitoring():
             max_epoch = max(available_epochs)
             
             # Return: training curve, latest validation image, updated slider, statistics
-            latest_val_path = Path(f'outputs/predictions/val_epoch{latest_epoch:03d}.png')
+            latest_val_path = predictions_dir / f'val_epoch{latest_epoch:03d}.png'
             
-            # Use gr.update() to update slider maximum and value
-            import gradio as gr
             slider_update = gr.update(maximum=max_epoch, value=latest_epoch)
             
             return curve, str(latest_val_path), slider_update, stats
     
     # If no validation images found, return default values
-    import gradio as gr
     return curve, None, gr.update(maximum=200, value=0), stats
 
 
@@ -471,7 +531,7 @@ with gr.Blocks(title="TransUNet Training Interface") as demo:
                     minimum=0,
                     maximum=200,
                     value=0,
-                    step=1,
+                    step=10,
                     label="Select Epoch"
                 )
                 
@@ -509,6 +569,9 @@ data/
 └── val/
     └── (same structure)
 ```
+
+**Note:** The system will automatically detect all task folders in your data directory.
+You can have 2, 3, or more tasks - just create the appropriate folders.
 
 ### 2. Configure Parameters
 - Adjust training parameters on the left panel
