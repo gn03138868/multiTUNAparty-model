@@ -446,6 +446,11 @@ class MultiTaskTrainer:
                 'loss': f'{loss.item():.4f}',
                 'lr': f'{self.optimizer.param_groups[0]["lr"]:.2e}'
             })
+            
+            # 定期清理 GPU 記憶體（每 100 個 batch）
+            if batch_idx % 100 == 0:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         
         avg_loss = total_loss / len(self.train_loader)
         
@@ -457,6 +462,10 @@ class MultiTaskTrainer:
     @torch.no_grad()
     def validate(self, epoch):
         """驗證"""
+        # 清理 GPU 記憶體
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
         self.model.eval()
         total_loss = 0.0
         all_metrics = []
@@ -715,6 +724,10 @@ class MultiTaskTrainer:
             # 繪製訓練歷史
             if (epoch + 1) % 10 == 0:
                 self.plot_history()
+            
+            # 每個 epoch 結束後清理記憶體
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
         # 保存最終模型
         torch.save(
