@@ -1,0 +1,20 @@
+batch_size: 4
+boundary_weights:
+  0: 2.0
+  1: 3.0
+  2: 5.0
+data_path: data/
+epochs: 200
+foreground_weights:
+  0: 1.0
+  1: 1.5
+  2: 3.0
+gpu_cache_clear_freq: 20
+gradient_accumulation_steps: 2
+invert_mask_tasks: []
+lr: 1.0e-05
+num_decoder_conv_layers: 80
+num_tasks: 3
+patch_size: 400
+task_structure: subfolder
+use_amp: true
