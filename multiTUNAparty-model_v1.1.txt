@@ -1,0 +1,4125 @@
+"""
+app_gui_en.py
+
+Multi-Task TransUNet - Desktop GUI (Tkinter) - FIXED VERSION
+修復大圖片輸出問題：使用滑動窗口方法處理大圖(超北七之前忘記把400x400拓展到整張圖片，導致訓練都很棒但是輸出跟大便一樣)
+
+修改內容：
+1. 使用滑動窗口處理大圖，而非直接縮放
+2. 輸出保持原始大小
+3. 支援任意尺寸的輸入圖片
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+from PIL import Image, ImageTk
+import threading
+import queue
+import os
+from pathlib import Path
+import torch
+import cv2
+import numpy as np
+import json
+import yaml
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from datetime import datetime
+import subprocess
+import sys
+
+# Import model - 支援兩種版本
+MODEL_VERSION = None
+try:
+    from model_multitask_boundaryversion import MultiTaskTransUNet
+    MODEL_AVAILABLE = True
+    MODEL_VERSION = "boundary"
+    print("✓ Using boundary-aware model version")
+except ImportError:
+    try:
+        from model_multitask import MultiTaskTransUNet
+        MODEL_AVAILABLE = True
+        MODEL_VERSION = "original"
+        print("✓ Using original model version")
+    except ImportError:
+        MODEL_AVAILABLE = False
+        print("Warning: No model file found")
+
+# Global configuration
+TASK_MAPPING = {
+    'Cell (Plant Cell)': 0,
+    'Blood (Blood Cell)': 1,
+    'Other (Other System)': 2
+}
+
+TASK_COLORS = {
+    0: 'Blues',
+    1: 'Reds',
+    2: 'Greens'
+}
+
+# Global variables
+loaded_model = None
+model_device = None
+
+
+# ============================================================================
+# 滑動窗口推理函數 (核心修復)
+# ============================================================================
+
+def sliding_window_inference(model, image, task_id, device, patch_size=400, overlap=0.25):
+    """
+    使用滑動窗口方法處理大圖片
+    
+    Args:
+        model: 訓練好的模型
+        image: 輸入圖片 (H, W, 3) RGB格式
+        task_id: 任務ID
+        device: 計算設備
+        patch_size: patch大小 (預設400)
+        overlap: 重疊比例 (預設25%)
+    
+    Returns:
+        prob_map: 概率圖 (H, W)，與原圖大小相同
+    """
+    H, W = image.shape[:2]
+    
+    # 如果圖片小於 patch_size，直接處理
+    if H <= patch_size and W <= patch_size:
+        # Pad to patch_size
+        padded = np.zeros((patch_size, patch_size, 3), dtype=np.uint8)
+        padded[:H, :W] = image
+        
+        img_tensor = torch.from_numpy(padded.astype(np.float32) / 255.0)
+        img_tensor = img_tensor.permute(2, 0, 1).unsqueeze(0).to(device)
+        
+        with torch.no_grad():
+            output = model(img_tensor, task_id=task_id)
+            if isinstance(output, dict):
+                seg_output = output.get('refined', output.get('seg', output.get('main')))
+            else:
+                seg_output = output
+            prob = torch.sigmoid(seg_output).cpu().numpy()[0, 0]
+        
+        return prob[:H, :W]
+    
+    # 計算步長
+    stride = int(patch_size * (1 - overlap))
+    
+    # 計算需要的 patches 數量
+    n_h = max(1, int(np.ceil((H - patch_size) / stride)) + 1)
+    n_w = max(1, int(np.ceil((W - patch_size) / stride)) + 1)
+    
+    # 初始化累積數組
+    prob_sum = np.zeros((H, W), dtype=np.float32)
+    count_map = np.zeros((H, W), dtype=np.float32)
+    
+    # 創建權重遮罩 (中心權重高，邊緣權重低)
+    weight = create_weight_mask(patch_size)
+    
+    total_patches = n_h * n_w
+    processed = 0
+    
+    for i in range(n_h):
+        for j in range(n_w):
+            # 計算 patch 位置
+            y_start = min(i * stride, H - patch_size)
+            x_start = min(j * stride, W - patch_size)
+            y_end = y_start + patch_size
+            x_end = x_start + patch_size
+            
+            # 提取 patch
+            patch = image[y_start:y_end, x_start:x_end]
+            
+            # 預處理
+            img_tensor = torch.from_numpy(patch.astype(np.float32) / 255.0)
+            img_tensor = img_tensor.permute(2, 0, 1).unsqueeze(0).to(device)
+            
+            # 推理
+            with torch.no_grad():
+                output = model(img_tensor, task_id=task_id)
+                if isinstance(output, dict):
+                    seg_output = output.get('refined', output.get('seg', output.get('main')))
+                else:
+                    seg_output = output
+                prob = torch.sigmoid(seg_output).cpu().numpy()[0, 0]
+            
+            # 加權累積
+            prob_sum[y_start:y_end, x_start:x_end] += prob * weight
+            count_map[y_start:y_end, x_start:x_end] += weight
+            
+            processed += 1
+    
+    # 計算平均
+    prob_map = prob_sum / (count_map + 1e-7)
+    
+    return prob_map
+
+
+def create_weight_mask(size):
+    """
+    創建權重遮罩，中心權重高，邊緣權重低
+    使用高斯權重避免拼接邊界
+    """
+    sigma = size / 4
+    x = np.arange(size)
+    y = np.arange(size)
+    X, Y = np.meshgrid(x, y)
+    
+    center = size / 2
+    weight = np.exp(-((X - center)**2 + (Y - center)**2) / (2 * sigma**2))
+    
+    # 確保邊緣不是完全為0
+    weight = weight + 0.1
+    weight = weight / weight.max()
+    
+    return weight.astype(np.float32)
+
+
+# ============================================================================
+# GUI 類
+# ============================================================================
+
+class MultiTaskGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Multi-Task TransUNet - Desktop Edition (Fixed)")
+        self.root.geometry("1200x800")
+        
+        # Create status bar
+        self.create_status_bar()
+        
+        # Create main notebook (tabs)
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill='both', expand=True, padx=5, pady=5)
+        
+        # Create feature tabs
+        self.create_model_tab()
+        self.create_predict_tab()
+        self.create_batch_tab()
+        self.create_help_tab()
+        
+        # Update status
+        self.update_status("Ready - Please load a model first")
+    
+    def create_status_bar(self):
+        """Create status bar"""
+        self.status_bar = tk.Label(
+            self.root, 
+            text="Ready", 
+            bd=1, 
+            relief=tk.SUNKEN, 
+            anchor=tk.W
+        )
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+    
+    def update_status(self, message):
+        """Update status bar"""
+        self.status_bar.config(text=message)
+        self.root.update_idletasks()
+    
+    # ========================================================================
+    # Tab 1: Model Management
+    # ========================================================================
+    
+    def create_model_tab(self):
+        """Create model management tab"""
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="📦 Model Management")
+        
+        # Title
+        title = tk.Label(tab, text="Model Loading and Management", font=('Arial', 16, 'bold'))
+        title.pack(pady=10)
+        
+        # Model selection area
+        model_frame = ttk.LabelFrame(tab, text="Select Model", padding=10)
+        model_frame.pack(fill='x', padx=10, pady=5)
+        
+        # Model path
+        path_frame = tk.Frame(model_frame)
+        path_frame.pack(fill='x', pady=5)
+        
+        tk.Label(path_frame, text="Model Path:").pack(side='left', padx=5)
+        self.model_path_var = tk.StringVar(value="outputs/models/best_model.pth")
+        model_entry = tk.Entry(path_frame, textvariable=self.model_path_var, width=50)
+        model_entry.pack(side='left', padx=5, fill='x', expand=True)
+        
+        tk.Button(
+            path_frame, 
+            text="Browse...", 
+            command=self.browse_model
+        ).pack(side='left', padx=5)
+        
+        # Device selection
+        device_frame = tk.Frame(model_frame)
+        device_frame.pack(fill='x', pady=5)
+        
+        tk.Label(device_frame, text="Computing Device:").pack(side='left', padx=5)
+        self.device_var = tk.StringVar(
+            value="GPU (CUDA)" if torch.cuda.is_available() else "CPU"
+        )
+        
+        ttk.Radiobutton(
+            device_frame, 
+            text="GPU (CUDA)", 
+            variable=self.device_var, 
+            value="GPU (CUDA)"
+        ).pack(side='left', padx=10)
+        
+        ttk.Radiobutton(
+            device_frame, 
+            text="CPU", 
+            variable=self.device_var, 
+            value="CPU"
+        ).pack(side='left', padx=10)
+        
+        # GPU information
+        if torch.cuda.is_available():
+            gpu_info = f"✅ GPU Available: {torch.cuda.get_device_name(0)}"
+        else:
+            gpu_info = "⚠️ GPU not available, CPU will be used (slower)"
+        
+        tk.Label(device_frame, text=gpu_info, fg='green' if torch.cuda.is_available() else 'orange').pack(side='left', padx=10)
+        
+        # Load button
+        tk.Button(
+            model_frame, 
+            text="📥 Load Model", 
+            command=self.load_model,
+            bg='#4CAF50',
+            fg='white',
+            font=('Arial', 12, 'bold'),
+            padx=20,
+            pady=10
+        ).pack(pady=10)
+        
+        # Model information display
+        info_frame = ttk.LabelFrame(tab, text="Model Information", padding=10)
+        info_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        self.model_info_text = scrolledtext.ScrolledText(
+            info_frame, 
+            height=15, 
+            wrap=tk.WORD
+        )
+        self.model_info_text.pack(fill='both', expand=True)
+        self.model_info_text.insert('1.0', "No model loaded\n\nPlease select a model file and click 'Load Model'")
+    
+    def browse_model(self):
+        """Browse and select model file"""
+        filename = filedialog.askopenfilename(
+            title="Select Model File",
+            filetypes=[("PyTorch Model", "*.pth"), ("All Files", "*.*")]
+        )
+        if filename:
+            self.model_path_var.set(filename)
+    
+    def load_model(self):
+        """Load model"""
+        global loaded_model, model_device
+        
+        if not MODEL_AVAILABLE:
+            messagebox.showerror("Error", "Cannot find model_multitask.py file!")
+            return
+        
+        model_path = self.model_path_var.get()
+        if not os.path.exists(model_path):
+            messagebox.showerror("Error", f"Model file does not exist:\n{model_path}")
+            return
+        
+        self.update_status("Loading model...")
+        self.model_info_text.delete('1.0', tk.END)
+        self.model_info_text.insert('1.0', "Loading model, please wait...\n")
+        
+        def load_thread():
+            global loaded_model, model_device
+            try:
+                # Set device
+                if self.device_var.get() == "GPU (CUDA)" and torch.cuda.is_available():
+                    device = torch.device('cuda')
+                    device_info = f"GPU: {torch.cuda.get_device_name(0)}"
+                else:
+                    device = torch.device('cpu')
+                    device_info = "CPU"
+                
+                # Create model
+                if MODEL_VERSION == "boundary":
+                    model = MultiTaskTransUNet(
+                        img_size=400,
+                        patch_size=16,
+                        num_decoder_layers=80,
+                        num_tasks=3,
+                        use_deep_supervision=True
+                    )
+                else:
+                    model = MultiTaskTransUNet(
+                        img_size=400,
+                        patch_size=16,
+                        num_decoder_layers=80,
+                        num_tasks=3
+                    )
+                
+                # Load weights
+                checkpoint = torch.load(model_path, map_location=device)
+                
+                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                    model.load_state_dict(checkpoint['model_state_dict'])
+                else:
+                    model.load_state_dict(checkpoint)
+                
+                model = model.to(device)
+                model.eval()
+                
+                loaded_model = model
+                model_device = device
+                
+                # Update info
+                param_count = sum(p.numel() for p in model.parameters())
+                info = f"""✅ Model loaded successfully!
+
+Model File: {model_path}
+Device: {device_info}
+Model Version: {MODEL_VERSION}
+Parameters: {param_count:,}
+
+🔧 Fixed Version Features:
+• Sliding window inference for large images
+• Output size matches input size
+• Supports images of any size
+"""
+                self.root.after(0, lambda: self.model_info_text.delete('1.0', tk.END))
+                self.root.after(0, lambda: self.model_info_text.insert('1.0', info))
+                self.root.after(0, lambda: self.update_status(f"Model loaded - {device_info}"))
+                
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to load model:\n{str(e)}"))
+                self.root.after(0, lambda: self.update_status("Model loading failed"))
+        
+        threading.Thread(target=load_thread, daemon=True).start()
+    
+    # ========================================================================
+    # Tab 2: Single Prediction
+    # ========================================================================
+    
+    def create_predict_tab(self):
+        """Create single prediction tab"""
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="🔍 Single Prediction")
+        
+        # Title
+        title = tk.Label(tab, text="Single Image Prediction", font=('Arial', 16, 'bold'))
+        title.pack(pady=10)
+        
+        # Settings
+        settings_frame = ttk.LabelFrame(tab, text="Prediction Settings", padding=10)
+        settings_frame.pack(fill='x', padx=10, pady=5)
+        
+        # Image selection
+        img_frame = tk.Frame(settings_frame)
+        img_frame.pack(fill='x', pady=5)
+        
+        tk.Label(img_frame, text="Image:").pack(side='left', padx=5)
+        self.predict_image_var = tk.StringVar()
+        img_entry = tk.Entry(img_frame, textvariable=self.predict_image_var, width=50)
+        img_entry.pack(side='left', padx=5, fill='x', expand=True)
+        
+        tk.Button(img_frame, text="Browse...", command=self.browse_predict_image).pack(side='left', padx=5)
+        
+        # Task selection
+        task_frame = tk.Frame(settings_frame)
+        task_frame.pack(fill='x', pady=5)
+        
+        tk.Label(task_frame, text="Task:").pack(side='left', padx=5)
+        self.predict_task_var = tk.StringVar(value="Cell (Plant Cell)")
+        ttk.Combobox(
+            task_frame, 
+            textvariable=self.predict_task_var, 
+            values=list(TASK_MAPPING.keys()),
+            width=25
+        ).pack(side='left', padx=5)
+        
+        # Threshold
+        tk.Label(task_frame, text="Threshold:").pack(side='left', padx=20)
+        self.threshold_var = tk.DoubleVar(value=0.5)
+        tk.Scale(
+            task_frame, 
+            from_=0.0, to=1.0, 
+            resolution=0.05,
+            orient='horizontal', 
+            variable=self.threshold_var,
+            length=200
+        ).pack(side='left', padx=5)
+        
+        # Overlap setting (new)
+        tk.Label(task_frame, text="Overlap:").pack(side='left', padx=10)
+        self.overlap_var = tk.DoubleVar(value=0.25)
+        tk.Scale(
+            task_frame, 
+            from_=0.0, to=0.5, 
+            resolution=0.05,
+            orient='horizontal', 
+            variable=self.overlap_var,
+            length=100
+        ).pack(side='left', padx=5)
+        
+        # Buttons
+        btn_frame = tk.Frame(settings_frame)
+        btn_frame.pack(fill='x', pady=10)
+        
+        tk.Button(
+            btn_frame, 
+            text="🚀 Start Prediction", 
+            command=self.run_prediction,
+            bg='#2196F3',
+            fg='white',
+            font=('Arial', 12, 'bold'),
+            padx=20,
+            pady=10
+        ).pack(side='left', padx=5)
+        
+        tk.Button(
+            btn_frame, 
+            text="💾 Save Result", 
+            command=self.save_prediction,
+            bg='#FF9800',
+            fg='white',
+            font=('Arial', 10),
+            padx=10,
+            pady=5
+        ).pack(side='left', padx=5)
+        
+        # Result display
+        result_frame = ttk.LabelFrame(tab, text="Prediction Result", padding=10)
+        result_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        self.result_canvas = tk.Canvas(result_frame, bg='white', height=400)
+        self.result_canvas.pack(fill='both', expand=True)
+        
+        # Image size label
+        self.size_label = tk.Label(result_frame, text="")
+        self.size_label.pack()
+    
+    def browse_predict_image(self):
+        """Browse and select image"""
+        filename = filedialog.askopenfilename(
+            title="Select Image",
+            filetypes=[("Image Files", "*.jpg *.jpeg *.png *.bmp"), ("All Files", "*.*")]
+        )
+        if filename:
+            self.predict_image_var.set(filename)
+    
+    def run_prediction(self):
+        """Run single prediction with sliding window"""
+        global loaded_model, model_device
+        
+        if loaded_model is None:
+            messagebox.showerror("Error", "Please load a model first!")
+            return
+        
+        image_path = self.predict_image_var.get()
+        if not os.path.exists(image_path):
+            messagebox.showerror("Error", f"Image file does not exist:\n{image_path}")
+            return
+        
+        self.update_status("Running prediction with sliding window...")
+        
+        def predict_thread():
+            try:
+                # Load image (keep original size)
+                image = cv2.imread(image_path)
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                H, W = image.shape[:2]
+                
+                # Get parameters
+                task_id = TASK_MAPPING[self.predict_task_var.get()]
+                threshold = self.threshold_var.get()
+                overlap = self.overlap_var.get()
+                
+                # Sliding window inference (FIXED!)
+                prob_map = sliding_window_inference(
+                    loaded_model, image, task_id, model_device,
+                    patch_size=400, overlap=overlap
+                )
+                
+                # Apply threshold
+                binary_mask = (prob_map > threshold).astype(np.uint8) * 255
+                
+                # Store results (original size!)
+                self.current_prediction = {
+                    'original': image,
+                    'prob_map': prob_map,
+                    'binary': binary_mask,
+                    'threshold': threshold,
+                    'size': (H, W)
+                }
+                
+                # Update display
+                self.root.after(0, self.display_prediction)
+                self.root.after(0, lambda: self.update_status(f"Prediction complete - Output size: {W}x{H}"))
+                
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                self.root.after(0, lambda: messagebox.showerror("Error", f"Prediction failed: {str(e)}"))
+                self.root.after(0, lambda: self.update_status("Prediction failed"))
+        
+        threading.Thread(target=predict_thread, daemon=True).start()
+    
+    def display_prediction(self):
+        """Display prediction results"""
+        if not hasattr(self, 'current_prediction'):
+            return
+        
+        pred = self.current_prediction
+        H, W = pred['size']
+        
+        # Update size label
+        self.size_label.config(text=f"Output size: {W} x {H} (same as input)")
+        
+        # Create combined visualisation
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        
+        axes[0].imshow(pred['original'])
+        axes[0].set_title(f'Original Image ({W}x{H})')
+        axes[0].axis('off')
+        
+        axes[1].imshow(pred['prob_map'], cmap='jet', vmin=0, vmax=1)
+        axes[1].set_title('Probability Map')
+        axes[1].axis('off')
+        
+        axes[2].imshow(pred['binary'], cmap='gray')
+        axes[2].set_title(f"Binary Mask (Threshold: {pred['threshold']:.2f})")
+        axes[2].axis('off')
+        
+        plt.tight_layout()
+        
+        # Save to temporary file
+        temp_path = Path('outputs/temp_prediction.png')
+        temp_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(temp_path, dpi=100, bbox_inches='tight')
+        plt.close()
+        
+        # Display
+        img = Image.open(temp_path)
+        img.thumbnail((1000, 500))
+        photo = ImageTk.PhotoImage(img)
+        
+        self.result_canvas.delete('all')
+        self.result_canvas.create_image(500, 250, image=photo)
+        self.result_canvas.image = photo
+    
+    def save_prediction(self):
+        """Save prediction result at original resolution"""
+        if not hasattr(self, 'current_prediction'):
+            messagebox.showerror("Error", "No prediction result to save!")
+            return
+        
+        # Ask for save directory
+        save_dir = filedialog.askdirectory(title="Select Save Directory")
+        if not save_dir:
+            return
+        
+        pred = self.current_prediction
+        base_name = Path(self.predict_image_var.get()).stem
+        
+        try:
+            # Save original (at original size)
+            cv2.imwrite(
+                os.path.join(save_dir, f'{base_name}_original.png'),
+                cv2.cvtColor(pred['original'], cv2.COLOR_RGB2BGR)
+            )
+            
+            # Save heatmap (at original size)
+            plt.figure(figsize=(pred['size'][1]/100, pred['size'][0]/100), dpi=100)
+            plt.imshow(pred['prob_map'], cmap='jet', vmin=0, vmax=1)
+            plt.axis('off')
+            plt.tight_layout(pad=0)
+            plt.savefig(os.path.join(save_dir, f'{base_name}_heatmap.png'), 
+                       dpi=100, bbox_inches='tight', pad_inches=0)
+            plt.close()
+            
+            # Save binary mask (at original size)
+            cv2.imwrite(
+                os.path.join(save_dir, f'{base_name}_binary.png'),
+                pred['binary']
+            )
+            
+            # Save overlay (at original size)
+            overlay = pred['original'].copy()
+            mask_colored = np.zeros_like(overlay)
+            mask_colored[pred['binary'] > 0] = [0, 255, 0]
+            overlay = cv2.addWeighted(overlay, 0.7, mask_colored, 0.3, 0)
+            cv2.imwrite(
+                os.path.join(save_dir, f'{base_name}_overlay.png'),
+                cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
+            )
+            
+            messagebox.showinfo("Success", 
+                f"Results saved to:\n{save_dir}\n\n"
+                f"Files:\n"
+                f"• {base_name}_original.png\n"
+                f"• {base_name}_heatmap.png\n"
+                f"• {base_name}_binary.png\n"
+                f"• {base_name}_overlay.png\n\n"
+                f"Size: {pred['size'][1]} x {pred['size'][0]}")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save: {str(e)}")
+    
+    # ========================================================================
+    # Tab 3: Batch Processing
+    # ========================================================================
+    
+    def create_batch_tab(self):
+        """Create batch processing tab"""
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="📁 Batch Processing")
+        
+        # Title
+        title = tk.Label(tab, text="Batch Image Processing (Full Resolution)", font=('Arial', 16, 'bold'))
+        title.pack(pady=10)
+        
+        # Settings area
+        settings_frame = ttk.LabelFrame(tab, text="Batch Settings", padding=10)
+        settings_frame.pack(fill='x', padx=10, pady=5)
+        
+        # Image selection
+        tk.Label(settings_frame, text="Selected Images:").pack(anchor='w')
+        
+        btn_frame = tk.Frame(settings_frame)
+        btn_frame.pack(fill='x', pady=5)
+        
+        tk.Button(btn_frame, text="📁 Select Images", command=self.select_batch_images).pack(side='left', padx=5)
+        tk.Button(btn_frame, text="📂 Select Folder", command=self.select_batch_folder).pack(side='left', padx=5)
+        tk.Button(btn_frame, text="🗑️ Clear Selection", command=self.clear_batch_selection).pack(side='left', padx=5)
+        
+        # File list
+        self.batch_files_text = scrolledtext.ScrolledText(settings_frame, height=5)
+        self.batch_files_text.pack(fill='x', pady=5)
+        
+        # Task and threshold
+        param_frame = tk.Frame(settings_frame)
+        param_frame.pack(fill='x', pady=5)
+        
+        tk.Label(param_frame, text="Task:").pack(side='left', padx=5)
+        self.batch_task_var = tk.StringVar(value="Cell (Plant Cell)")
+        ttk.Combobox(param_frame, textvariable=self.batch_task_var, values=list(TASK_MAPPING.keys()), width=20).pack(side='left', padx=5)
+        
+        tk.Label(param_frame, text="Threshold:").pack(side='left', padx=5)
+        self.batch_threshold_var = tk.DoubleVar(value=0.5)
+        tk.Scale(param_frame, from_=0.0, to=1.0, resolution=0.05, orient='horizontal', 
+                 variable=self.batch_threshold_var, length=100).pack(side='left', padx=5)
+        
+        tk.Label(param_frame, text="Overlap:").pack(side='left', padx=5)
+        self.batch_overlap_var = tk.DoubleVar(value=0.25)
+        tk.Scale(param_frame, from_=0.0, to=0.5, resolution=0.05, orient='horizontal', 
+                 variable=self.batch_overlap_var, length=100).pack(side='left', padx=5)
+        
+        # Run button
+        tk.Button(
+            settings_frame,
+            text="🚀 Start Batch Processing (Full Resolution)",
+            command=self.run_batch_prediction,
+            bg='#FF9800',
+            fg='white',
+            font=('Arial', 12, 'bold'),
+            pady=10
+        ).pack(pady=10)
+        
+        # Progress
+        progress_frame = ttk.LabelFrame(tab, text="Progress", padding=10)
+        progress_frame.pack(fill='x', padx=10, pady=5)
+        
+        self.batch_progress = ttk.Progressbar(progress_frame, mode='determinate')
+        self.batch_progress.pack(fill='x', pady=5)
+        
+        self.batch_status_label = tk.Label(progress_frame, text="Ready")
+        self.batch_status_label.pack()
+        
+        # Results
+        results_frame = ttk.LabelFrame(tab, text="Processing Log", padding=10)
+        results_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        self.batch_results_text = scrolledtext.ScrolledText(results_frame, height=10)
+        self.batch_results_text.pack(fill='both', expand=True)
+        
+        # Store batch files
+        self.batch_files = []
+    
+    def select_batch_images(self):
+        """Select multiple images"""
+        files = filedialog.askopenfilenames(
+            title="Select Images",
+            filetypes=[("Image Files", "*.jpg *.jpeg *.png *.bmp"), ("All Files", "*.*")]
+        )
+        if files:
+            self.batch_files.extend(files)
+            self.update_batch_file_list()
+    
+    def select_batch_folder(self):
+        """Select folder containing images"""
+        folder = filedialog.askdirectory(title="Select Image Folder")
+        if folder:
+            folder_path = Path(folder)
+            image_files = list(folder_path.glob('*.jpg')) + list(folder_path.glob('*.jpeg')) + \
+                         list(folder_path.glob('*.png')) + list(folder_path.glob('*.bmp')) + \
+                         list(folder_path.glob('*.JPG')) + list(folder_path.glob('*.PNG'))
+            self.batch_files.extend([str(f) for f in image_files])
+            self.update_batch_file_list()
+    
+    def clear_batch_selection(self):
+        """Clear batch file selection"""
+        self.batch_files = []
+        self.update_batch_file_list()
+    
+    def update_batch_file_list(self):
+        """Update batch file list display"""
+        self.batch_files_text.delete('1.0', tk.END)
+        self.batch_files_text.insert('1.0', f"Selected {len(self.batch_files)} images:\n")
+        for f in self.batch_files[:10]:
+            self.batch_files_text.insert(tk.END, f"  • {Path(f).name}\n")
+        if len(self.batch_files) > 10:
+            self.batch_files_text.insert(tk.END, f"  ... and {len(self.batch_files) - 10} more\n")
+    
+    def run_batch_prediction(self):
+        """Run batch prediction with sliding window (FIXED!)"""
+        global loaded_model, model_device
+        
+        if loaded_model is None:
+            messagebox.showerror("Error", "Please load a model first!")
+            return
+        
+        if not self.batch_files:
+            messagebox.showerror("Error", "No images selected!")
+            return
+        
+        # Create output directory
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        task_name = self.batch_task_var.get().split(' ')[0]
+        output_dir = Path(f'outputs/batch_predictions/{timestamp}_{task_name}')
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.batch_results_text.delete('1.0', tk.END)
+        self.batch_results_text.insert('1.0', f"Output directory: {output_dir}\n")
+        self.batch_results_text.insert(tk.END, f"🔧 Using sliding window inference (full resolution output)\n\n")
+        
+        def batch_thread():
+            task_id = TASK_MAPPING[self.batch_task_var.get()]
+            threshold = self.batch_threshold_var.get()
+            overlap = self.batch_overlap_var.get()
+            total = len(self.batch_files)
+            
+            for i, image_path in enumerate(self.batch_files):
+                try:
+                    # Update progress
+                    progress = (i + 1) / total * 100
+                    self.root.after(0, lambda p=progress: self.batch_progress.configure(value=p))
+                    self.root.after(0, lambda n=i+1, t=total: self.batch_status_label.configure(
+                        text=f"Processing {n}/{t}..."))
+                    
+                    # Load image (keep original size!)
+                    image = cv2.imread(image_path)
+                    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                    H, W = image.shape[:2]
+                    
+                    # Sliding window inference (FIXED!)
+                    prob_map = sliding_window_inference(
+                        loaded_model, image, task_id, model_device,
+                        patch_size=400, overlap=overlap
+                    )
+                    
+                    binary_mask = (prob_map > threshold).astype(np.uint8) * 255
+                    
+                    # Save results (at original size!)
+                    base_name = Path(image_path).stem
+                    
+                    # Original
+                    cv2.imwrite(str(output_dir / f'{base_name}_original.png'), 
+                               cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+                    
+                    # Heatmap (using matplotlib for colormap)
+                    plt.figure(figsize=(W/100, H/100), dpi=100)
+                    plt.imshow(prob_map, cmap='jet', vmin=0, vmax=1)
+                    plt.axis('off')
+                    plt.tight_layout(pad=0)
+                    plt.savefig(str(output_dir / f'{base_name}_heatmap.png'), 
+                               dpi=100, bbox_inches='tight', pad_inches=0)
+                    plt.close()
+                    
+                    # Binary mask
+                    cv2.imwrite(str(output_dir / f'{base_name}_binary.png'), binary_mask)
+                    
+                    # Overlay
+                    overlay = image.copy()
+                    mask_colored = np.zeros_like(overlay)
+                    mask_colored[binary_mask > 0] = [0, 255, 0]
+                    overlay = cv2.addWeighted(overlay, 0.7, mask_colored, 0.3, 0)
+                    cv2.imwrite(str(output_dir / f'{base_name}_overlay.png'), 
+                               cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+                    
+                    # Update log
+                    self.root.after(0, lambda p=image_path, w=W, h=H: self.batch_results_text.insert(
+                        tk.END, f"✓ {Path(p).name} ({w}x{h})\n"))
+                    
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    self.root.after(0, lambda p=image_path, err=e: self.batch_results_text.insert(
+                        tk.END, f"✗ {Path(p).name}: {err}\n"))
+            
+            # Complete
+            self.root.after(0, lambda: self.batch_status_label.configure(text="Complete!"))
+            self.root.after(0, lambda: self.batch_results_text.insert(
+                tk.END, f"\n✅ Batch processing complete!\n"
+                f"Results saved to: {output_dir}\n"
+                f"All outputs are at ORIGINAL RESOLUTION!"))
+            self.root.after(0, lambda: messagebox.showinfo("Complete", 
+                f"Batch processing complete!\n\n"
+                f"Results saved to:\n{output_dir}\n\n"
+                f"All outputs are at ORIGINAL RESOLUTION!"))
+        
+        threading.Thread(target=batch_thread, daemon=True).start()
+    
+    # ========================================================================
+    # Tab 4: Help
+    # ========================================================================
+    
+    def create_help_tab(self):
+        """Create help tab"""
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="📖 Help")
+        
+        help_text = scrolledtext.ScrolledText(tab, wrap=tk.WORD, font=('Arial', 10))
+        help_text.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        help_content = """
+Multi-Task TransUNet - FIXED VERSION
+
+═══════════════════════════════════════════════════════════
+
+Overlap：
+   • 0.0 = on any overlap,
+   • 0.25 = 25% overlap
+   • 0.5 = 50% overlap
+
+═══════════════════════════════════════════════════════════
+
+If you have any further questions, please feel free to contect Shitephen.
+email: gn03138868@gmail.com; shitephenwang@ntu.edu.tw
+
+═══════════════════════════════════════════════════════════
+"""
+        
+        help_text.insert('1.0', help_content)
+        help_text.config(state='disabled')
+
+
+def main():
+    """Main programme"""
+    root = tk.Tk()
+    app = MultiTaskGUI(root)
+    
+    print("\n" + "="*60)
+    print("🚀 Multi-Task TransUNet - FIXED VERSION")
+    print("="*60)
+    print("\n✅ 修復內容：")
+    print("   • 使用滑動窗口處理大圖")
+    print("   • 輸出大小 = 輸入大小")
+    print("   • 支援任意解析度")
+    print("\n" + "="*60 + "\n")
+    
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    Path('outputs/models').mkdir(parents=True, exist_ok=True)
+    Path('outputs/predictions').mkdir(parents=True, exist_ok=True)
+    
+    main()
+
+
+
+"""
+app_train_en.py
+
+TransUNet Training Web Interface (Gradio)
+Dedicated to model training functionality
+"""
+
+import gradio as gr
+import subprocess
+import sys
+import yaml
+from pathlib import Path
+import json
+import time
+import os
+
+# Global variables
+training_process = None
+training_status = {
+    'is_training': False,
+    'current_epoch': 0,
+    'total_epochs': 0,
+    'train_loss': 0.0,
+    'val_loss': 0.0,
+    'val_iou': 0.0,
+    'message': 'Training not yet started',
+    'log_file': '',
+    'error_message': ''
+}
+
+def start_training(batch_size, epochs, lr, patch_size, num_layers, data_path, 
+                  use_pretrained, pretrained_path):
+    """Start training"""
+    global training_process, training_status
+    
+    # Check if already training
+    if training_status['is_training']:
+        return "⚠️ Training is already in progress! Please wait for the current training to complete or stop it first."
+    
+    try:
+        # Update configuration
+        config = {
+            'batch_size': int(batch_size),
+            'epochs': int(epochs),
+            'lr': float(lr),
+            'patch_size': int(patch_size),
+            'num_decoder_conv_layers': int(num_layers),
+            'data_path': data_path,
+            'task_structure': 'subfolder',
+            'boundary_weights': {0: 2.0, 1: 3.0, 2: 5.0},
+            'foreground_weights': {0: 1.0, 1: 1.5, 2: 3.0},
+            # 新增參數
+            'invert_mask_tasks': [],  # 如果需要反轉 Cell 的 mask，改成 [0]
+            'gradient_accumulation_steps': 2,  # 梯度累積，減少 GPU 記憶體使用
+            'gpu_cache_clear_freq': 20,  # 更頻繁清理 GPU 記憶體
+            'use_amp': True,  # 混合精度訓練
+            'num_tasks': 3,
+        }
+        
+        # Add pre-trained settings
+        if use_pretrained and pretrained_path:
+            config['pretrained_model_path'] = pretrained_path
+        
+        # Save configuration
+        config_path = Path('config_training_ui.yaml')
+        with open(config_path, 'w', encoding='utf-8') as f:
+            yaml.dump(config, f, allow_unicode=True, default_flow_style=False)
+        
+        # Create training log file
+        log_file = Path('outputs/training_ui.log')
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Initialise training status
+        training_status = {
+            'is_training': True,
+            'current_epoch': 0,
+            'total_epochs': int(epochs),
+            'train_loss': 0.0,
+            'val_loss': 0.0,
+            'val_iou': 0.0,
+            'message': 'Starting training...',
+            'log_file': str(log_file),
+            'error_message': ''
+        }
+        
+        # Start training in background thread
+        def run_training():
+            global training_process, training_status
+            
+            try:
+                print("\n" + "="*60)
+                print("Starting Training...")
+                print("="*60)
+                print(f"Configuration file: {config_path}")
+                print(f"Log file: {log_file}")
+                print(f"Batch Size: {batch_size}")
+                print(f"Epochs: {epochs}")
+                print(f"Learning Rate: {lr}")
+                print("="*60 + "\n")
+                
+                # Start training process
+                training_process = subprocess.Popen(
+                    [sys.executable, 'train_multitask_optimized.py', '--config', str(config_path)],
+                )
+                
+                training_status['message'] = '✅ Training has started! Please check the terminal window for detailed output.'
+                
+                # Wait for training to complete
+                training_process.wait()
+                
+                # Check return code
+                if training_process.returncode == 0:
+                    training_status['message'] = '✅ Training completed successfully!'
+                else:
+                    training_status['message'] = f'❌ Training failed (return code: {training_process.returncode})'
+                
+            except Exception as e:
+                training_status['error_message'] = str(e)
+                training_status['message'] = f'❌ Failed to start training: {str(e)}'
+                print(f"Training error: {e}")
+            finally:
+                training_status['is_training'] = False
+                training_process = None
+        
+        # Start training thread
+        import threading
+        training_thread = threading.Thread(target=run_training, daemon=True)
+        training_thread.start()
+        
+        return f"""
+Training has been successfully started!
+
+Training Configuration:
+• Batch Size: {batch_size}
+• Epochs: {epochs}
+• Learning Rate: {lr}
+• Patch Size: {patch_size}
+• Decoder Layers: {num_layers}
+• Data Path: {data_path}
+• Pre-trained Model: {'Yes (' + pretrained_path + ')' if use_pretrained else 'No'}
+
+Tips:
+• Detailed training output will be displayed in the terminal (CMD/Terminal)
+• Please keep the terminal window open to view training progress
+• Models will be automatically saved to outputs/models/
+• Training history will be saved to outputs/training_history.json
+
+Click "Refresh Training Status" to view current progress
+"""
+        
+    except Exception as e:
+        return f"❌ Error: {str(e)}"
+
+
+def stop_training():
+    """Stop training"""
+    global training_process, training_status
+    
+    if not training_status['is_training']:
+        return "⚠️ No training is currently in progress."
+    
+    try:
+        if training_process and training_process.poll() is None:
+            training_process.terminate()
+            training_process.wait(timeout=5)
+            training_status['is_training'] = False
+            training_status['message'] = '⏹️ Training stopped'
+            return "✅ Training has been stopped successfully."
+        else:
+            training_status['is_training'] = False
+            return "⚠️ Training process has already finished."
+    except Exception as e:
+        return f"❌ Error occurred whilst stopping training: {str(e)}"
+
+
+def get_training_status():
+    """Get training status"""
+    global training_status
+    
+    if not training_status['is_training']:
+        return training_status['message']
+    
+    # Try to read training history
+    history_file = Path('outputs/training_history.json')
+    if history_file.exists():
+        try:
+            with open(history_file, 'r', encoding='utf-8') as f:
+                history = json.load(f)
+            
+            if history and len(history.get('train_loss', [])) > 0:
+                current_epoch = len(history['train_loss'])
+                train_loss = history['train_loss'][-1]
+                val_loss = history['val_loss'][-1]
+                val_iou = history['val_iou'][-1]
+                
+                return f"""
+🔄 Training in progress...
+
+Current Progress:
+• Epoch: {current_epoch}/{training_status['total_epochs']}
+• Train Loss: {train_loss:.4f}
+• Val Loss: {val_loss:.4f}
+• Val IoU: {val_iou:.4f}
+
+Tip: Detailed training output is displayed in the terminal window
+"""
+        except:
+            pass
+    
+    return training_status['message']
+
+
+def check_data_structure(data_path):
+    """Check data structure"""
+    try:
+        data_path = Path(data_path)
+        
+        if not data_path.exists():
+            return f"❌ Data path does not exist: {data_path}"
+        
+        # Check training and validation folders
+        train_path = data_path / 'train'
+        val_path = data_path / 'val'
+        
+        if not train_path.exists():
+            return f"❌ Training folder not found: {train_path}"
+        if not val_path.exists():
+            return f"❌ Validation folder not found: {val_path}"
+        
+        # Detect available task folders
+        available_tasks = []
+        for task_folder in train_path.iterdir():
+            if task_folder.is_dir():
+                available_tasks.append(task_folder.name)
+        
+        if not available_tasks:
+            return f"❌ No task folders found in {train_path}"
+        
+        result = f"✅ Data Structure Check Results:\n\n"
+        result += f"📋 Detected {len(available_tasks)} tasks: {', '.join(available_tasks)}\n\n"
+        
+        for split in ['train', 'val']:
+            split_path = data_path / split
+            result += f"📁 {split}/\n"
+            
+            for task in available_tasks:
+                task_path = split_path / task
+                if not task_path.exists():
+                    result += f"  ❌ {task}/ - Does not exist\n"
+                    continue
+                
+                images_path = task_path / 'images'
+                masks_path = task_path / 'masks'
+                
+                if not images_path.exists():
+                    result += f"  ❌ {task}/images/ - Does not exist\n"
+                elif not masks_path.exists():
+                    result += f"  ❌ {task}/masks/ - Does not exist\n"
+                else:
+                    num_images = len(list(images_path.glob('*')))
+                    num_masks = len(list(masks_path.glob('*')))
+                    result += f"  ✅ {task}/ - {num_images} images, {num_masks} masks\n"
+            
+            result += "\n"
+        
+        return result
+        
+    except Exception as e:
+        return f"❌ Error occurred during check: {str(e)}"
+
+
+def load_training_curve():
+    """Load training curve"""
+    curve_path = Path('outputs/training_history.png')
+    if curve_path.exists():
+        return str(curve_path)
+    return None
+
+
+def load_validation_image(epoch):
+    """Load validation image"""
+    try:
+        epoch = int(epoch)
+        val_image_path = Path(f'outputs/predictions/val_epoch{epoch:03d}.png')
+        if val_image_path.exists():
+            return str(val_image_path)
+    except:
+        pass
+    return None
+
+
+def get_training_stats():
+    """Get training statistics (supports dynamic number of tasks)"""
+    history_path = Path('outputs/training_history.json')
+    
+    if not history_path.exists():
+        return "❌ Training history file not found\n\nPlease complete at least one training session first."
+    
+    try:
+        with open(history_path, 'r', encoding='utf-8') as f:
+            history = json.load(f)
+        
+        # Debug: show available keys
+        available_keys = list(history.keys()) if isinstance(history, dict) else "Not a dict"
+        
+        # Handle different possible formats
+        train_loss = history.get('train_loss', history.get('loss', []))
+        val_loss = history.get('val_loss', history.get('validation_loss', []))
+        val_iou = history.get('val_iou', history.get('iou', []))
+        val_dice = history.get('val_dice', history.get('dice', []))
+        
+        total_epochs = len(train_loss) if train_loss else 0
+        
+        if total_epochs == 0:
+            return f"❌ Training history is empty or has unexpected format\n\nAvailable keys: {available_keys}"
+        
+        # Calculate statistics with safe access
+        stats = f"""
+{'='*60}
+TRAINING STATISTICS
+{'='*60}
+
+Total Epochs: {total_epochs}
+"""
+        
+        # Loss progression (with safety checks)
+        if train_loss and len(train_loss) > 0:
+            stats += f"""
+📉 Loss Progression:
+  Initial Train Loss: {train_loss[0]:.4f}
+  Final Train Loss:   {train_loss[-1]:.4f}"""
+        
+        if val_loss and len(val_loss) > 0:
+            stats += f"""
+  Initial Val Loss:   {val_loss[0]:.4f}
+  Final Val Loss:     {val_loss[-1]:.4f}
+"""
+        
+        # IoU progression
+        if val_iou and len(val_iou) > 0:
+            stats += f"""
+📈 IoU Progression:
+  Initial Val IoU: {val_iou[0]:.4f}
+  Final Val IoU:   {val_iou[-1]:.4f}
+  Improvement:     {val_iou[-1] - val_iou[0]:.4f}
+"""
+        
+        # Dice progression
+        if val_dice and len(val_dice) > 0:
+            stats += f"""
+📊 Dice Progression:
+  Initial Val Dice: {val_dice[0]:.4f}
+  Final Val Dice:   {val_dice[-1]:.4f}
+  Improvement:      {val_dice[-1] - val_dice[0]:.4f}
+"""
+        
+        stats += f"""
+{'='*60}
+
+Per-Task Performance (Final Epoch):
+"""
+        
+        # Get task names from history (if available) or use defaults
+        task_names = history.get('task_names', {})
+        if not task_names:
+            task_names = {'0': 'Cell', '1': 'Blood', '2': 'Root'}
+        
+        # Convert keys to strings if needed
+        if isinstance(task_names, dict):
+            task_names = {str(k): v for k, v in task_names.items()}
+        
+        # Per-task performance (dynamic)
+        task_metrics = history.get('task_metrics', {})
+        
+        if task_metrics:
+            for task_id_str, metrics in task_metrics.items():
+                task_name = task_names.get(str(task_id_str), f'Task_{task_id_str}')
+                if metrics and len(metrics) > 0:
+                    final_metric = metrics[-1]
+                    if isinstance(final_metric, dict):
+                        stats += f"\n{task_name}:"
+                        stats += f"\n  IoU: {final_metric.get('iou', 0):.4f}"
+                        stats += f"\n  Dice: {final_metric.get('dice', 0):.4f}"
+                        stats += f"\n  Precision: {final_metric.get('precision', 0):.4f}"
+                        stats += f"\n  Recall: {final_metric.get('recall', 0):.4f}\n"
+        else:
+            stats += "\n(No per-task metrics available)"
+        
+        return stats
+        
+    except json.JSONDecodeError as e:
+        return f"❌ Invalid JSON format in training history: {str(e)}"
+    except Exception as e:
+        # More detailed error info
+        import traceback
+        return f"❌ Error reading training history: {str(e)}\n\nType: {type(e).__name__}\n\nTraceback:\n{traceback.format_exc()}"
+
+
+def refresh_monitoring():
+    """Refresh all monitoring data"""
+    curve = load_training_curve()
+    stats = get_training_stats()
+    
+    # Check if predictions directory exists
+    predictions_dir = Path('outputs/predictions')
+    if not predictions_dir.exists():
+        return curve, None, gr.update(maximum=200, value=0), stats
+    
+    # Find all available validation images
+    try:
+        val_images = sorted(list(predictions_dir.glob('val_epoch*.png')))
+    except Exception as e:
+        return curve, None, gr.update(maximum=200, value=0), stats
+    
+    if val_images:
+        # Extract all epoch numbers
+        available_epochs = []
+        for img_path in val_images:
+            try:
+                epoch_num = int(img_path.stem.replace('val_epoch', ''))
+                available_epochs.append(epoch_num)
+            except:
+                pass
+        
+        if available_epochs:
+            # Find the latest epoch
+            latest_epoch = max(available_epochs)
+            max_epoch = max(available_epochs)
+            
+            # Return: training curve, latest validation image, updated slider, statistics
+            latest_val_path = predictions_dir / f'val_epoch{latest_epoch:03d}.png'
+            
+            slider_update = gr.update(maximum=max_epoch, value=latest_epoch)
+            
+            return curve, str(latest_val_path), slider_update, stats
+    
+    # If no validation images found, return default values
+    return curve, None, gr.update(maximum=200, value=0), stats
+
+
+# Create Gradio interface
+with gr.Blocks(title="TransUNet Training Interface") as demo:
+    
+    gr.Markdown("# TransUNet Multi-Task Training Interface")
+    gr.Markdown("Dedicated to model training | For prediction, please use Tkinter GUI (app_gui.py)")
+    
+    with gr.Row():
+        with gr.Column(scale=1):
+            gr.Markdown("## ⚙️ Training Settings")
+            
+            batch_size = gr.Slider(
+                minimum=1, maximum=16, value=4, step=1,
+                label="Batch Size",
+                info="Batch size, depends on GPU memory"
+            )
+            
+            epochs = gr.Slider(
+                minimum=1, maximum=500, value=200, step=1,
+                label="Epochs",
+                info="Number of training epochs"
+            )
+            
+            lr = gr.Textbox(
+                value="1e-5",
+                label="Learning Rate",
+                info="Learning rate (recommended: 1e-5 to 1e-4)"
+            )
+            
+            patch_size = gr.Slider(
+                minimum=128, maximum=512, value=400, step=32,
+                label="Patch Size",
+                info="Image patch size"
+            )
+            
+            num_layers = gr.Slider(
+                minimum=20, maximum=120, value=80, step=10,
+                label="Decoder Conv Layers",
+                info="Number of decoder convolutional layers"
+            )
+            
+            data_path = gr.Textbox(
+                value="data/",
+                label="Data Path",
+                info="Dataset path"
+            )
+            
+            check_data_btn = gr.Button("Check Data Structure", variant="secondary")
+            data_check_output = gr.Textbox(
+                label="Data Check Results",
+                lines=10,
+                interactive=False
+            )
+            
+            gr.Markdown("### Pre-trained Model (Optional)")
+            
+            use_pretrained = gr.Checkbox(
+                label="Use Pre-trained Model",
+                value=False
+            )
+            
+            pretrained_path = gr.Textbox(
+                value="",
+                label="Pre-trained Model Path",
+                placeholder="e.g., outputs/models/best_model.pth"
+            )
+        
+        with gr.Column(scale=1):
+            gr.Markdown("## 🎮 Training Control")
+            
+            with gr.Row():
+                start_btn = gr.Button("Start Training", variant="primary", size="lg")
+                stop_btn = gr.Button("Stop Training", variant="stop", size="lg")
+            
+            refresh_btn = gr.Button("Refresh Training Status", variant="secondary")
+            
+            training_output = gr.Textbox(
+                label="Training Messages",
+                lines=15,
+                interactive=False
+            )
+    
+    # Training monitoring tab
+    with gr.Tab("Training Monitoring"):
+        gr.Markdown("## Training Results Monitoring")
+        
+        with gr.Row():
+            with gr.Column():
+                refresh_monitor_btn = gr.Button("Refresh Monitoring", variant="primary")
+                
+                gr.Markdown("### Training Curves")
+                training_curve = gr.Image(
+                    label="Training History Curves",
+                    type="filepath"
+                )
+                
+            with gr.Column():
+                gr.Markdown("### Validation Images")
+                epoch_slider = gr.Slider(
+                    minimum=0,
+                    maximum=200,
+                    value=0,
+                    step=10,
+                    label="Select Epoch"
+                )
+                
+                val_image = gr.Image(
+                    label="Validation Results",
+                    type="filepath"
+                )
+        
+        gr.Markdown("### Training Statistics")
+        stats_output = gr.Textbox(
+            label="Training Data Statistics",
+            lines=10,
+            interactive=False
+        )
+    
+    # User guide
+    with gr.Tab("User Guide"):
+        gr.Markdown("""
+## User Guide
+
+### 1. Prepare Data
+Ensure your data structure is as follows:
+```
+data/
+├── train/
+│   ├── cell/
+│   │   ├── images/
+│   │   └── masks/
+│   ├── blood/
+│   │   ├── images/
+│   │   └── masks/
+│   └── root/
+│       ├── images/
+│       └── masks/
+└── val/
+    └── (same structure)
+```
+
+**Note:** The system will automatically detect all task folders in your data directory.
+You can have 2, 3, or more tasks - just create the appropriate folders.
+
+### 2. Configure Parameters
+- Adjust training parameters on the left panel
+- Click "Check Data Structure" to verify your data is correct
+
+### 3. Start Training
+- Click "Start Training"
+- View detailed output in the terminal window
+- Periodically click "Refresh Training Status" to check progress
+
+### 4. Output Locations
+- Models: `outputs/models/`
+- Training history: `outputs/training_history.json`
+- Logs: `outputs/training_ui.log`
+
+### Tips
+- Training process will display detailed information in the terminal
+- Please keep the terminal window open
+- You can stop training at any time
+- Use a pre-trained model to continue training
+
+### Related Tools
+- **Prediction and Inference**: Use `app_gui_en.py` (Tkinter GUI)
+- **Training Monitoring**: View `outputs/training_history.json`
+        """)
+    
+    # Event handlers
+    start_btn.click(
+        fn=start_training,
+        inputs=[batch_size, epochs, lr, patch_size, num_layers, data_path, 
+                use_pretrained, pretrained_path],
+        outputs=training_output
+    )
+    
+    stop_btn.click(
+        fn=stop_training,
+        outputs=training_output
+    )
+    
+    refresh_btn.click(
+        fn=get_training_status,
+        outputs=training_output
+    )
+    
+    check_data_btn.click(
+        fn=check_data_structure,
+        inputs=data_path,
+        outputs=data_check_output
+    )
+    
+    # Training monitoring events
+    refresh_monitor_btn.click(
+        fn=refresh_monitoring,
+        outputs=[training_curve, val_image, epoch_slider, stats_output]
+    )
+    
+    epoch_slider.change(
+        fn=load_validation_image,
+        inputs=epoch_slider,
+        outputs=val_image
+    )
+
+
+if __name__ == "__main__":
+    print("\n" + "="*60)
+    print("TransUNet Training Interface")
+    print("="*60)
+    print("Dedicated to model training functionality")
+    print("For prediction, please use: python app_gui.py")
+    print("="*60)
+    print("\nLaunching browser...")
+    print("If the browser does not open automatically, please visit: http://localhost:7860")
+    print("\n")
+    
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=False,
+        show_error=True,
+        inbrowser=True,
+        quiet=False
+    )
+
+
+
+"""
+dataset_multitask.py
+
+多任務分割資料集
+支援自動識別或手動指定影像任務類型
+"""
+
+import os
+import cv2
+import numpy as np
+import albumentations as A
+from torch.utils.data import Dataset
+import torch
+from pathlib import Path
+
+class MultiTaskSegmentationDataset(Dataset):
+    """
+    多任務分割資料集
+    
+    資料夾結構方案一（推薦）- 按任務分類：
+    data/
+    ├── train/
+    │   ├── cell/          # 植物細胞
+    │   │   ├── images/
+    │   │   └── masks/
+    │   ├── blood/         # 血球
+    │   │   ├── images/
+    │   │   └── masks/
+    │   └── root/          # 根系
+    │       ├── images/
+    │       └── masks/
+    
+    資料夾結構方案二 - 傳統結構（需要在檔名中標記任務）：
+    data/
+    ├── train/
+    │   ├── images/
+    │   │   ├── cell_001.jpg
+    │   │   ├── blood_001.jpg
+    │   │   └── root_001.jpg
+    │   └── masks/
+    │       ├── cell_001.png
+    │       ├── blood_001.png
+    │       └── root_001.png
+    """
+    
+    TASK_MAPPING = {
+        'cell': 0,    # 植物細胞
+        'blood': 1,   # 血球
+        'root': 2     # 根系
+    }
+    
+    def __init__(
+        self, 
+        data_root, 
+        mode='train', 
+        patch_size=400,
+        task_structure='subfolder',  # 'subfolder' 或 'filename'
+        augment_params=None
+    ):
+        """
+        Args:
+            data_root: 資料根目錄
+            mode: 'train', 'val', 或 'test'
+            patch_size: patch 大小
+            task_structure: 
+                - 'subfolder': 任務按子資料夾分類
+                - 'filename': 任務標記在檔名中 (e.g., cell_001.jpg)
+            augment_params: 自定義的數據增強參數字典
+        """
+        self.data_root = data_root
+        self.mode = mode
+        self.patch_size = patch_size
+        self.task_structure = task_structure
+        
+        # 載入所有影像和對應的任務標籤
+        self.samples = []  # [(image_path, mask_path, task_id), ...]
+        self._load_samples()
+        
+        # 配置數據增強
+        self.augment_configs = self._get_augmentation_configs(augment_params)
+        
+        # 預先生成所有 patches
+        self.patches = []
+        self.patch_image_ids = []  # 記錄每個patch來自哪張圖片
+        self._precompute_patches()
+        
+        print(f"Loaded {len(self.patches)} patches from {len(self.samples)} images")
+        self._print_task_distribution()
+    
+    def _load_samples(self):
+        """載入所有影像樣本和對應的任務標籤"""
+        
+        if self.task_structure == 'subfolder':
+            # 方案一：按子資料夾分類
+            base_path = Path(self.data_root) / self.mode
+            
+            for task_name, task_id in self.TASK_MAPPING.items():
+                task_path = base_path / task_name
+                
+                if not task_path.exists():
+                    continue
+                
+                image_dir = task_path / 'images'
+                mask_dir = task_path / 'masks'
+                
+                if not image_dir.exists() or not mask_dir.exists():
+                    continue
+                
+                image_files = sorted([f for f in os.listdir(image_dir) 
+                                    if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
+                
+                for img_file in image_files:
+                    # 尋找對應的 mask（可能是 .png 或其他格式）
+                    mask_file = self._find_matching_mask(img_file, mask_dir)
+                    
+                    if mask_file:
+                        img_path = image_dir / img_file
+                        mask_path = mask_dir / mask_file
+                        self.samples.append((str(img_path), str(mask_path), task_id))
+        
+        else:  # 'filename'
+            # 方案二：從檔名中識別任務類型
+            image_dir = Path(self.data_root) / self.mode / 'images'
+            mask_dir = Path(self.data_root) / self.mode / 'masks'
+            
+            if not image_dir.exists():
+                raise ValueError(f"Image directory not found: {image_dir}")
+            
+            image_files = sorted([f for f in os.listdir(image_dir) 
+                                if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
+            
+            for img_file in image_files:
+                # 從檔名中提取任務類型
+                task_id = self._extract_task_from_filename(img_file)
+                
+                mask_file = self._find_matching_mask(img_file, mask_dir)
+                
+                if mask_file:
+                    img_path = image_dir / img_file
+                    mask_path = mask_dir / mask_file
+                    self.samples.append((str(img_path), str(mask_path), task_id))
+    
+    def _find_matching_mask(self, img_file, mask_dir):
+        """尋找對應的 mask 檔案"""
+        base_name = os.path.splitext(img_file)[0]
+        
+        # 嘗試不同的擴展名
+        for ext in ['.png', '.PNG', '.jpg', '.JPG', '.jpeg', '.JPEG']:
+            mask_file = base_name + ext
+            if (mask_dir / mask_file).exists():
+                return mask_file
+        
+        return None
+    
+    def _extract_task_from_filename(self, filename):
+        """從檔名中提取任務類型"""
+        filename_lower = filename.lower()
+        
+        for task_name, task_id in self.TASK_MAPPING.items():
+            if filename_lower.startswith(task_name):
+                return task_id
+        
+        # 預設為細胞任務
+        print(f"Warning: Cannot determine task type from filename '{filename}', defaulting to 'cell'")
+        return 0
+    
+    def _get_augmentation_configs(self, augment_params=None):
+        """
+        為不同任務配置不同的數據增強策略
+        """
+        if augment_params:
+            # 使用自定義參數
+            return {
+                0: self._build_transform(augment_params.get('cell', {})),
+                1: self._build_transform(augment_params.get('blood', {})),
+                2: self._build_transform(augment_params.get('root', {}))
+            }
+        
+        # 預設配置
+        configs = {}
+        
+        # 植物細胞：需要保持多邊形結構，使用適度的形變
+        configs[0] = A.Compose([
+            A.RandomRotate90(p=0.5),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
+            A.ElasticTransform(alpha=1, sigma=50, p=0.2),
+            A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.2)
+        ], additional_targets={'mask': 'mask'})
+        
+        # 血球：圓形結構，需要較少的形變
+        configs[1] = A.Compose([
+            A.RandomRotate90(p=0.5),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.4),
+            A.ElasticTransform(alpha=0.5, sigma=30, p=0.15),  # 較小的形變
+            A.GaussNoise(var_limit=(10.0, 30.0), p=0.2)  # 添加噪聲模擬染色不均
+        ], additional_targets={'mask': 'mask'})
+        
+        # 根系：線性結構，主要調整對比度，避免過度形變
+        configs[2] = A.Compose([
+            A.RandomRotate90(p=0.5),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.4, p=0.5),
+            # 根系不使用 ElasticTransform 和 GridDistortion
+            A.GaussianBlur(blur_limit=(3, 5), p=0.2)  # 輕微模糊模擬不同焦距
+        ], additional_targets={'mask': 'mask'})
+        
+        return configs
+    
+    def _build_transform(self, params):
+        """根據參數構建數據增強"""
+        transforms = []
+        
+        if params.get('rotate', True):
+            transforms.append(A.RandomRotate90(p=0.5))
+        if params.get('hflip', True):
+            transforms.append(A.HorizontalFlip(p=0.5))
+        if params.get('vflip', True):
+            transforms.append(A.VerticalFlip(p=0.5))
+        if params.get('brightness', True):
+            transforms.append(A.RandomBrightnessContrast(p=0.3))
+        
+        return A.Compose(transforms, additional_targets={'mask': 'mask'})
+    
+    def _precompute_patches(self):
+        """預先生成所有 patches"""
+        for img_path, mask_path, task_id in self.samples:
+            try:
+                image = cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB)
+                mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                
+                if image is None or mask is None:
+                    print(f"Warning: Failed to load {img_path} or {mask_path}")
+                    continue
+                
+                # 驗證尺寸
+                if image.shape[:2] != mask.shape:
+                    print(f"Warning: Size mismatch in {img_path}")
+                    continue
+                
+                # 提取image_id（檔名不含副檔名）
+                image_id = Path(img_path).stem  # 例如 "L_15"
+                
+                # 生成 patches
+                patches = self._extract_patches(image, mask, task_id)
+                self.patches.extend(patches)
+                
+                # 為這張圖片的每個patch記錄image_id
+                for _ in range(len(patches)):
+                    self.patch_image_ids.append(image_id)
+                
+            except Exception as e:
+                print(f"Error processing {img_path}: {e}")
+    
+    def _extract_patches(self, image, mask, task_id):
+        """提取 patches"""
+        h, w = image.shape[:2]
+        stride = self.patch_size // 2  # 50% 重疊
+        patches = []
+        
+        for y in range(0, h - self.patch_size + 1, stride):
+            for x in range(0, w - self.patch_size + 1, stride):
+                img_patch = image[y:y+self.patch_size, x:x+self.patch_size]
+                mask_patch = mask[y:y+self.patch_size, x:x+self.patch_size]
+                
+                # 訓練時應用任務特定的數據增強
+                if self.mode == 'train':
+                    augmented = self.augment_configs[task_id](
+                        image=img_patch, 
+                        mask=mask_patch
+                    )
+                    img_patch = augmented['image']
+                    mask_patch = augmented['mask']
+                
+                patches.append((img_patch, mask_patch, task_id))
+        
+        return patches
+    
+    def _print_task_distribution(self):
+        """列印任務分佈"""
+        task_counts = {0: 0, 1: 0, 2: 0}
+        task_images = {0: set(), 1: set(), 2: set()}  # 統計每個任務有多少張獨立圖片
+        
+        for idx, (_, _, task_id) in enumerate(self.patches):
+            task_counts[task_id] += 1
+            task_images[task_id].add(self.patch_image_ids[idx])
+        
+        task_names = {0: 'Cell', 1: 'Blood', 2: 'Root'}
+        print(f"\nTask distribution in {self.mode} set:")
+        for task_id, count in task_counts.items():
+            n_images = len(task_images[task_id])
+            print(f"  {task_names[task_id]}: {count} patches from {n_images} images")
+    
+    def __len__(self):
+        return len(self.patches)
+    
+    def __getitem__(self, idx):
+        img_patch, mask_patch, task_id = self.patches[idx]
+        image_id = self.patch_image_ids[idx]  # 獲取此patch的image_id
+        
+        # 歸一化並轉換為 Tensor
+        img_tensor = torch.from_numpy(
+            img_patch.astype(np.float32) / 255.0
+        ).permute(2, 0, 1)
+        
+        mask_tensor = torch.from_numpy(
+            (mask_patch / 255.0).astype(np.float32)
+        ).unsqueeze(0)
+        
+        task_tensor = torch.tensor(task_id, dtype=torch.long)
+        
+        return img_tensor, mask_tensor, task_tensor, image_id  # 返回4個值
+    
+    @staticmethod
+    def get_task_name(task_id):
+        """獲取任務名稱"""
+        task_names = {0: 'Cell', 1: 'Blood', 2: 'Root'}
+        return task_names.get(task_id, 'Unknown')
+
+# 測試程式碼
+
+if __name__ == '__main__':
+    print("Testing MultiTaskSegmentationDataset...")
+    
+    # 測試資料夾結構方案一
+    try:
+        dataset = MultiTaskSegmentationDataset(
+            data_root='data',
+            mode='train',
+            patch_size=400,
+            task_structure='subfolder'
+        )
+        
+        print(f"\nTotal patches: {len(dataset)}")
+        
+        # 測試載入一個樣本
+        if len(dataset) > 0:
+            img, mask, task, image_id = dataset[0]
+            print(f"\nSample 0:")
+            print(f"  Image shape: {img.shape}")
+            print(f"  Mask shape: {mask.shape}")
+            print(f"  Task: {MultiTaskSegmentationDataset.get_task_name(task.item())}")
+            print(f"  Image ID: {image_id}")
+    
+    except Exception as e:
+        print(f"Error: {e}")
+        print("\nPlease check your data structure:")
+        print("data/")
+        print("├── train/")
+        print("│   ├── cell/")
+        print("│   │   ├── images/")
+        print("│   │   └── masks/")
+        print("│   ├── blood/")
+        print("│   │   ├── images/")
+        print("│   │   └── masks/")
+        print("│   └── root/")
+        print("│       ├── images/")
+        print("│       └── masks/")
+
+
+"""
+model_multitask_boundaryversion.py
+
+多任務 TransUNet - 邊界感知增強版本
+針對植物細胞、血球、根系三種影像的邊界清晰分割
+
+主要改進：
+1. 雙頭輸出：分割頭 + 邊界檢測頭
+2. 邊界感知精煉模組 (Boundary-Aware Refinement)
+3. 梯度增強邊界檢測 (Gradient-based Edge Detection)
+4. 深度監督 (Deep Supervision)
+5. 多尺度邊界融合
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+# ============================================================================
+# 注意力模塊
+# ============================================================================
+
+class ChannelAttention(nn.Module):
+    """通道注意力 - 幫助模型關注重要的特徵通道"""
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        reduced = max(channels // reduction, 8)  # 確保至少有8個通道
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, reduced, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(reduced, channels, 1, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        out = self.sigmoid(avg_out + max_out)
+        return x * out
+
+class SpatialAttention(nn.Module):
+    """空間注意力 - 幫助模型關注重要的空間位置（特別是邊界）"""
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size//2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        out = torch.cat([avg_out, max_out], dim=1)
+        out = self.sigmoid(self.conv(out))
+        return x * out
+
+class CBAM(nn.Module):
+    """CBAM - 結合通道和空間注意力"""
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.channel_attention = ChannelAttention(channels, reduction)
+        self.spatial_attention = SpatialAttention()
+    
+    def forward(self, x):
+        x = self.channel_attention(x)
+        x = self.spatial_attention(x)
+        return x
+
+
+# ============================================================================
+# 邊界檢測模塊
+# ============================================================================
+
+class GradientEdgeDetector(nn.Module):
+    """
+    基於梯度的邊界檢測
+    使用Sobel算子計算梯度，增強邊界特徵
+    """
+    def __init__(self, in_channels):
+        super().__init__()
+        # Sobel kernels
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32)
+        
+        self.register_buffer('sobel_x', sobel_x.view(1, 1, 3, 3).repeat(in_channels, 1, 1, 1))
+        self.register_buffer('sobel_y', sobel_y.view(1, 1, 3, 3).repeat(in_channels, 1, 1, 1))
+        
+        self.in_channels = in_channels
+    
+    def forward(self, x):
+        # 計算梯度
+        grad_x = F.conv2d(x, self.sobel_x, padding=1, groups=self.in_channels)
+        grad_y = F.conv2d(x, self.sobel_y, padding=1, groups=self.in_channels)
+        
+        # 計算梯度幅度
+        gradient_magnitude = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-8)
+        
+        return gradient_magnitude
+
+
+class BoundaryDetectionHead(nn.Module):
+    """
+    邊界檢測頭
+    專門用於檢測和增強邊界特徵
+    """
+    def __init__(self, in_channels, mid_channels=64):
+        super().__init__()
+        
+        # 梯度檢測
+        self.gradient_detector = GradientEdgeDetector(in_channels)
+        
+        # 邊界特徵提取
+        self.boundary_conv = nn.Sequential(
+            # 小感受野，捕捉細節
+            nn.Conv2d(in_channels * 2, mid_channels, 3, padding=1, bias=False),
+            nn.GroupNorm(8, mid_channels),
+            nn.ReLU(inplace=True),
+            
+            # 1x1 卷積融合
+            nn.Conv2d(mid_channels, mid_channels, 1, bias=False),
+            nn.GroupNorm(8, mid_channels),
+            nn.ReLU(inplace=True),
+            
+            # 輸出邊界概率
+            nn.Conv2d(mid_channels, 1, 1)
+        )
+        
+        # 多尺度邊界檢測（小kernel捕捉精細邊界）
+        self.edge_conv_3x3 = nn.Conv2d(in_channels, mid_channels // 2, 3, padding=1, bias=False)
+        self.edge_conv_1x1 = nn.Conv2d(in_channels, mid_channels // 2, 1, bias=False)
+        
+        self.edge_fusion = nn.Sequential(
+            nn.GroupNorm(8, mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, 1, 1)
+        )
+    
+    def forward(self, x):
+        # 梯度特徵
+        gradient_feat = self.gradient_detector(x)
+        
+        # 結合原始特徵和梯度特徵
+        combined = torch.cat([x, gradient_feat], dim=1)
+        boundary_out = self.boundary_conv(combined)
+        
+        # 多尺度邊界
+        edge_3x3 = self.edge_conv_3x3(x)
+        edge_1x1 = self.edge_conv_1x1(x)
+        multi_scale_edge = torch.cat([edge_3x3, edge_1x1], dim=1)
+        multi_scale_out = self.edge_fusion(multi_scale_edge)
+        
+        # 融合兩種邊界檢測結果
+        boundary = (boundary_out + multi_scale_out) / 2
+        
+        return boundary
+
+
+class BoundaryAwareRefinement(nn.Module):
+    """
+    邊界感知精煉模組
+    利用邊界資訊來精煉分割結果
+    """
+    def __init__(self, seg_channels, boundary_channels=1, out_channels=1):
+        super().__init__()
+        
+        # 邊界特徵擴展
+        self.boundary_expand = nn.Sequential(
+            nn.Conv2d(boundary_channels, 16, 3, padding=1, bias=False),
+            nn.GroupNorm(4, 16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 32, 3, padding=1, bias=False),
+            nn.GroupNorm(8, 32),
+            nn.ReLU(inplace=True)
+        )
+        
+        # 分割特徵處理
+        self.seg_conv = nn.Sequential(
+            nn.Conv2d(seg_channels, 32, 3, padding=1, bias=False),
+            nn.GroupNorm(8, 32),
+            nn.ReLU(inplace=True)
+        )
+        
+        # 邊界引導注意力
+        self.boundary_attention = nn.Sequential(
+            nn.Conv2d(32, 32, 3, padding=1, bias=False),
+            nn.GroupNorm(8, 32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, 1),
+            nn.Sigmoid()
+        )
+        
+        # 融合層
+        self.fusion = nn.Sequential(
+            nn.Conv2d(64, 32, 3, padding=1, bias=False),
+            nn.GroupNorm(8, 32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 16, 3, padding=1, bias=False),
+            nn.GroupNorm(4, 16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, out_channels, 1)
+        )
+    
+    def forward(self, seg_feat, boundary_pred):
+        # 處理邊界預測
+        boundary_feat = self.boundary_expand(torch.sigmoid(boundary_pred))
+        
+        # 處理分割特徵
+        seg_feat = self.seg_conv(seg_feat)
+        
+        # 邊界引導注意力
+        boundary_attn = self.boundary_attention(boundary_feat)
+        
+        # 使用邊界注意力增強分割特徵（邊界區域得到更多關注）
+        enhanced_seg = seg_feat * (1 + boundary_attn)
+        
+        # 融合
+        combined = torch.cat([enhanced_seg, boundary_feat], dim=1)
+        refined = self.fusion(combined)
+        
+        return refined
+
+
+# ============================================================================
+# 多尺度特徵融合模塊
+# ============================================================================
+
+class ASPP(nn.Module):
+    """
+    Atrous Spatial Pyramid Pooling - 多尺度特徵提取
+    使用 GroupNorm 以支援 batch_size=1 的情況
+    """
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        
+        # 確保 out_channels 可被 groups 整除
+        groups = min(32, out_channels)
+        while out_channels % groups != 0:
+            groups -= 1
+        
+        # 不同膨脹率的卷積 - 捕捉不同尺度的特徵
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 1, bias=False),
+            nn.GroupNorm(groups, out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=6, dilation=6, bias=False),
+            nn.GroupNorm(groups, out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=12, dilation=12, bias=False),
+            nn.GroupNorm(groups, out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.conv4 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=18, dilation=18, bias=False),
+            nn.GroupNorm(groups, out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        # 全局平均池化分支
+        self.global_pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, out_channels, 1, bias=False),
+            nn.GroupNorm(groups, out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        # 融合所有分支
+        self.fusion = nn.Sequential(
+            nn.Conv2d(out_channels * 5, out_channels, 1, bias=False),
+            nn.GroupNorm(groups, out_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1)
+        )
+    
+    def forward(self, x):
+        size = x.shape[2:]
+        
+        feat1 = self.conv1(x)
+        feat2 = self.conv2(x)
+        feat3 = self.conv3(x)
+        feat4 = self.conv4(x)
+        feat5 = F.interpolate(self.global_pool(x), size=size, mode='bilinear', align_corners=False)
+        
+        out = torch.cat([feat1, feat2, feat3, feat4, feat5], dim=1)
+        out = self.fusion(out)
+        
+        return out
+
+
+# ============================================================================
+# 任務嵌入模塊
+# ============================================================================
+
+class TaskEmbedding(nn.Module):
+    """
+    任務條件化 - 讓模型知道當前處理的是哪種影像
+    task_id: 0=植物細胞, 1=血球, 2=根系
+    """
+    def __init__(self, num_tasks=3, embed_dim=256):
+        super().__init__()
+        self.embedding = nn.Embedding(num_tasks, embed_dim)
+        self.norm = nn.LayerNorm(embed_dim)
+    
+    def forward(self, task_id, batch_size):
+        if isinstance(task_id, int):
+            task_id = torch.tensor([task_id] * batch_size, dtype=torch.long)
+        
+        task_emb = self.embedding(task_id.to(self.embedding.weight.device))
+        task_emb = self.norm(task_emb)
+        
+        return task_emb
+
+
+# ============================================================================
+# 改進的 Decoder 塊（加入邊界感知）
+# ============================================================================
+
+class BoundaryAwareDecoderBlock(nn.Module):
+    """
+    邊界感知解碼塊
+    在解碼過程中保持邊界清晰度
+    """
+    def __init__(self, in_channels, out_channels, task_embed_dim=256):
+        super().__init__()
+        
+        # 任務條件化的投影層
+        self.task_proj = nn.Linear(task_embed_dim, in_channels)
+        
+        groups = min(32, out_channels)
+        while out_channels % groups != 0:
+            groups -= 1
+        
+        in_groups = min(32, in_channels)
+        while in_channels % in_groups != 0:
+            in_groups -= 1
+        
+        # 主要卷積層（使用 GroupNorm）
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False),
+            nn.GroupNorm(groups, out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
+            nn.GroupNorm(groups, out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        # 邊界增強卷積（小kernel保持邊界細節）
+        self.edge_conv = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, 1, bias=False),
+            nn.GroupNorm(groups, out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        # 注意力機制
+        self.attention = CBAM(out_channels)
+        
+        # 殘差連接的投影層
+        self.residual_proj = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+    
+    def forward(self, x, task_emb=None):
+        residual = x
+        
+        # 如果有任務嵌入，添加到特徵中
+        if task_emb is not None:
+            task_weight = self.task_proj(task_emb)
+            task_weight = task_weight.unsqueeze(-1).unsqueeze(-1)
+            x = x + task_weight
+        
+        # 主要卷積
+        out = self.conv1(x)
+        out = self.conv2(out)
+        
+        # 邊界增強
+        edge_feat = self.edge_conv(out)
+        out = out + edge_feat
+        
+        # 注意力
+        out = self.attention(out)
+        
+        # 殘差連接
+        out = out + self.residual_proj(residual)
+        
+        return out
+
+
+# ============================================================================
+# Transformer Block
+# ============================================================================
+
+class TransformerBlock(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4., dropout=0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim)
+        
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden_dim, dim),
+            nn.Dropout(dropout)
+        )
+    
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x), self.norm1(x), self.norm1(x))[0]
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+# ============================================================================
+# 主模型：邊界感知多任務 TransUNet
+# ============================================================================
+
+class MultiTaskTransUNet(nn.Module):
+    """
+    邊界感知多任務 TransUNet
+    
+    主要特性：
+    1. 雙頭輸出：分割頭 + 邊界檢測頭
+    2. 邊界感知精煉模組
+    3. 任務條件化編碼器和解碼器
+    4. 多尺度特徵融合 (ASPP)
+    5. 深度監督（可選）
+    """
+    def __init__(
+        self,
+        img_size=400,
+        patch_size=16,
+        in_channels=3,
+        num_classes=1,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        mlp_ratio=4,
+        num_decoder_layers=80,
+        num_tasks=3,
+        task_embed_dim=256,
+        use_deep_supervision=True
+    ):
+        super().__init__()
+        
+        self.use_deep_supervision = use_deep_supervision
+        self.img_size = img_size
+        
+        # 任務嵌入
+        self.task_embedding = TaskEmbedding(num_tasks, task_embed_dim)
+        
+        # ViT Encoder
+        self.patch_embed = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+        
+        num_patches = (img_size // patch_size) ** 2
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
+        self.pos_drop = nn.Dropout(p=0.1)
+        
+        # Transformer blocks
+        self.blocks = nn.ModuleList([
+            TransformerBlock(embed_dim, num_heads, mlp_ratio)
+            for _ in range(depth)
+        ])
+        
+        self.norm = nn.LayerNorm(embed_dim)
+        
+        # 多尺度特徵融合
+        self.aspp = ASPP(embed_dim, 256)
+        
+        # Decoder - 使用邊界感知解碼塊
+        decoder_channels = [256, 128, 64, 32]
+        self.decoder_blocks = nn.ModuleList()
+        
+        in_ch = 256
+        for i, out_ch in enumerate(decoder_channels):
+            layers = []
+            num_blocks = num_decoder_layers // len(decoder_channels)
+            for j in range(num_blocks):
+                if j == 0:
+                    layers.append(BoundaryAwareDecoderBlock(in_ch, out_ch, task_embed_dim))
+                else:
+                    layers.append(BoundaryAwareDecoderBlock(out_ch, out_ch, task_embed_dim))
+            self.decoder_blocks.append(nn.ModuleList(layers))
+            in_ch = out_ch
+        
+        # 上採樣層
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        
+        # ============== 分割頭 ==============
+        self.seg_head = nn.Sequential(
+            nn.Conv2d(32, 16, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, num_classes, 1)
+        )
+        
+        # ============== 邊界檢測頭 ==============
+        self.boundary_head = BoundaryDetectionHead(32, mid_channels=32)
+        
+        # ============== 邊界感知精煉模組 ==============
+        self.boundary_refinement = BoundaryAwareRefinement(
+            seg_channels=num_classes, 
+            boundary_channels=1, 
+            out_channels=num_classes
+        )
+        
+        # ============== 深度監督（可選）==============
+        if use_deep_supervision:
+            # 從不同解碼器層輸出
+            self.deep_seg_heads = nn.ModuleList([
+                nn.Conv2d(ch, num_classes, 1) for ch in [256, 128, 64]
+            ])
+            self.deep_boundary_heads = nn.ModuleList([
+                nn.Conv2d(ch, 1, 1) for ch in [256, 128, 64]
+            ])
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                if m.weight is not None:
+                    nn.init.constant_(m.weight, 1)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x, task_id=0):
+        """
+        Args:
+            x: 輸入影像 [B, 3, H, W]
+            task_id: 任務ID (0=植物細胞, 1=血球, 2=根系)
+        
+        Returns:
+            訓練時: dict with 'seg', 'boundary', 'refined', 'deep_seg', 'deep_boundary'
+            推論時: 精煉後的分割結果
+        """
+        B, C, H, W = x.shape
+        
+        # 獲取任務嵌入
+        task_emb = self.task_embedding(task_id, B)
+        
+        # Patch embedding
+        x = self.patch_embed(x)
+        x = x.flatten(2).transpose(1, 2)
+        
+        # 添加位置嵌入
+        x = x + self.pos_embed
+        x = self.pos_drop(x)
+        
+        # Transformer encoding
+        for block in self.blocks:
+            x = block(x)
+        
+        x = self.norm(x)
+        
+        # Reshape back to spatial
+        grid_size = int(math.sqrt(x.shape[1]))
+        x = x.transpose(1, 2).reshape(B, -1, grid_size, grid_size)
+        
+        # 多尺度特徵融合
+        x = self.aspp(x)
+        
+        # Decoder with task conditioning
+        deep_features = []  # 用於深度監督
+        
+        for i, stage_blocks in enumerate(self.decoder_blocks):
+            for block in stage_blocks:
+                x = block(x, task_emb)
+            
+            # 保存深度監督用的特徵（上採樣前）
+            if self.use_deep_supervision and i < 3:
+                deep_features.append(x)
+            
+            x = self.upsample(x)
+        
+        # ============== 分割輸出 ==============
+        seg_out = self.seg_head(x)
+        
+        # ============== 邊界輸出 ==============
+        boundary_out = self.boundary_head(x)
+        
+        # ============== 邊界感知精煉 ==============
+        refined_out = self.boundary_refinement(seg_out, boundary_out)
+        
+        # 最終輸出 = 原始分割 + 精煉結果（殘差學習）
+        final_out = seg_out + refined_out
+        
+        # 調整到原始大小
+        if final_out.shape[2:] != (H, W):
+            final_out = F.interpolate(final_out, size=(H, W), mode='bilinear', align_corners=False)
+            seg_out = F.interpolate(seg_out, size=(H, W), mode='bilinear', align_corners=False)
+            boundary_out = F.interpolate(boundary_out, size=(H, W), mode='bilinear', align_corners=False)
+        
+        if self.training:
+            output = {
+                'seg': seg_out,
+                'boundary': boundary_out,
+                'refined': final_out,
+            }
+            
+            # 深度監督輸出
+            if self.use_deep_supervision:
+                deep_segs = []
+                deep_boundaries = []
+                for i, feat in enumerate(deep_features):
+                    deep_seg = self.deep_seg_heads[i](feat)
+                    deep_boundary = self.deep_boundary_heads[i](feat)
+                    deep_seg = F.interpolate(deep_seg, size=(H, W), mode='bilinear', align_corners=False)
+                    deep_boundary = F.interpolate(deep_boundary, size=(H, W), mode='bilinear', align_corners=False)
+                    deep_segs.append(deep_seg)
+                    deep_boundaries.append(deep_boundary)
+                
+                output['deep_seg'] = deep_segs
+                output['deep_boundary'] = deep_boundaries
+            
+            return output
+        else:
+            # 推論時返回精煉後的結果
+            return final_out
+
+
+# ============================================================================
+# 邊界感知損失函數
+# ============================================================================
+
+class BoundaryAwareLoss(nn.Module):
+    """
+    邊界感知損失函數
+    結合分割損失和邊界損失
+    """
+    def __init__(
+        self,
+        boundary_weights=None,
+        foreground_weights=None,
+        deep_supervision_weights=None,
+        smooth=1e-5
+    ):
+        super().__init__()
+        
+        self.boundary_weights = boundary_weights or {
+            0: 2.0,   # 細胞
+            1: 3.0,   # 血球
+            2: 5.0    # 根系
+        }
+        
+        self.foreground_weights = foreground_weights or {
+            0: 1.0,
+            1: 1.5,
+            2: 3.0
+        }
+        
+        # 深度監督權重（從深到淺遞減）
+        self.deep_supervision_weights = deep_supervision_weights or [0.4, 0.2, 0.1]
+        
+        self.smooth = smooth
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+    
+    def forward(self, outputs, targets, task_ids, boundary_targets=None):
+        """
+        Args:
+            outputs: dict from model containing 'seg', 'boundary', 'refined', etc.
+            targets: 真實分割標籤 [B, 1, H, W]
+            task_ids: 任務ID [B]
+            boundary_targets: 真實邊界標籤（可選，如果沒有會自動生成）
+        """
+        batch_size = targets.shape[0]
+        
+        # 如果沒有邊界標籤，自動生成
+        if boundary_targets is None:
+            boundary_targets = self._generate_boundary_targets(targets)
+        
+        total_loss = 0.0
+        loss_dict = {}
+        
+        # 1. 主分割損失
+        seg_loss = self._compute_seg_loss(outputs['seg'], targets, task_ids)
+        total_loss += seg_loss
+        loss_dict['seg_loss'] = seg_loss.item()
+        
+        # 2. 邊界損失
+        boundary_loss = self._compute_boundary_loss(outputs['boundary'], boundary_targets, task_ids)
+        total_loss += boundary_loss
+        loss_dict['boundary_loss'] = boundary_loss.item()
+        
+        # 3. 精煉後的分割損失
+        refined_loss = self._compute_seg_loss(outputs['refined'], targets, task_ids)
+        total_loss += refined_loss
+        loss_dict['refined_loss'] = refined_loss.item()
+        
+        # 4. 深度監督損失
+        if 'deep_seg' in outputs:
+            deep_loss = 0.0
+            for i, (deep_seg, deep_boundary) in enumerate(zip(outputs['deep_seg'], outputs['deep_boundary'])):
+                weight = self.deep_supervision_weights[i]
+                deep_loss += weight * self._compute_seg_loss(deep_seg, targets, task_ids)
+                deep_loss += weight * 0.5 * self._compute_boundary_loss(deep_boundary, boundary_targets, task_ids)
+            total_loss += deep_loss
+            loss_dict['deep_loss'] = deep_loss.item()
+        
+        loss_dict['total_loss'] = total_loss.item()
+        
+        return total_loss, loss_dict
+    
+    def _generate_boundary_targets(self, targets):
+        """從分割標籤自動生成邊界標籤"""
+        # 使用形態學運算生成邊界
+        kernel_size = 3
+        
+        # Dilation - Erosion = Boundary
+        targets_float = targets.float()
+        
+        # 膨脹
+        dilated = F.max_pool2d(targets_float, kernel_size, stride=1, padding=kernel_size//2)
+        
+        # 腐蝕（使用負值再取max再取負）
+        eroded = -F.max_pool2d(-targets_float, kernel_size, stride=1, padding=kernel_size//2)
+        
+        # 邊界 = 膨脹 - 腐蝕
+        boundary = dilated - eroded
+        
+        return boundary
+    
+    def _compute_seg_loss(self, pred, target, task_ids):
+        """計算分割損失"""
+        batch_size = pred.shape[0]
+        total_loss = 0.0
+        
+        for i in range(batch_size):
+            task_id = task_ids[i].item()
+            p = pred[i:i+1]
+            t = target[i:i+1]
+            
+            # Dice Loss
+            pred_sigmoid = torch.sigmoid(p).clamp(min=1e-7, max=1-1e-7)
+            pred_flat = pred_sigmoid.view(-1)
+            target_flat = t.view(-1)
+            
+            intersection = (pred_flat * target_flat).sum()
+            union = pred_flat.sum() + target_flat.sum()
+            dice = (2. * intersection + self.smooth) / (union + self.smooth)
+            dice_loss = 1 - dice
+            
+            # BCE Loss
+            bce_loss = self.bce(p, t).mean()
+            
+            # 前景加權
+            fg_mask = (t > 0.5).float()
+            bg_mask = (t <= 0.5).float()
+            fg_count = fg_mask.sum()
+            bg_count = bg_mask.sum()
+            
+            if fg_count > 0:
+                fg_weight = torch.clamp(bg_count / (fg_count + 1e-7), min=1.0, max=10.0)
+                weighted_bce = self.bce(p, t)
+                weighted_bce = weighted_bce * (fg_mask * fg_weight + bg_mask)
+                weighted_bce = weighted_bce.mean()
+            else:
+                weighted_bce = bce_loss
+            
+            sample_loss = dice_loss + bce_loss + self.foreground_weights[task_id] * weighted_bce
+            total_loss += sample_loss
+        
+        return total_loss / batch_size
+    
+    def _compute_boundary_loss(self, pred, target, task_ids):
+        """計算邊界損失"""
+        batch_size = pred.shape[0]
+        total_loss = 0.0
+        
+        for i in range(batch_size):
+            task_id = task_ids[i].item()
+            p = pred[i:i+1]
+            t = target[i:i+1]
+            
+            # BCE Loss for boundary
+            bce_loss = self.bce(p, t).mean()
+            
+            # Dice Loss for boundary
+            pred_sigmoid = torch.sigmoid(p).clamp(min=1e-7, max=1-1e-7)
+            pred_flat = pred_sigmoid.view(-1)
+            target_flat = t.view(-1)
+            
+            intersection = (pred_flat * target_flat).sum()
+            union = pred_flat.sum() + target_flat.sum()
+            dice = (2. * intersection + self.smooth) / (union + self.smooth)
+            dice_loss = 1 - dice
+            
+            sample_loss = self.boundary_weights[task_id] * (bce_loss + dice_loss)
+            total_loss += sample_loss
+        
+        return total_loss / batch_size
+
+
+# ============================================================================
+# 測試和實用函數
+# ============================================================================
+
+def count_parameters(model):
+    """計算模型參數量"""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+def test_model():
+    """測試模型"""
+    print("Testing Boundary-Aware MultiTaskTransUNet...")
+    print("="*60)
+    
+    model = MultiTaskTransUNet(
+        img_size=400,
+        patch_size=16,
+        num_decoder_layers=80,
+        num_tasks=3,
+        use_deep_supervision=True
+    )
+    
+    print(f"Total parameters: {count_parameters(model):,}")
+    
+    # 測試訓練模式
+    model.train()
+    x = torch.randn(2, 3, 400, 400)
+    
+    for task_id, task_name in enumerate(['Plant Cell', 'Blood Cell', 'Root']):
+        print(f"\nTesting {task_name} (task_id={task_id})...")
+        outputs = model(x, task_id=task_id)
+        
+        print(f"  Seg output shape: {outputs['seg'].shape}")
+        print(f"  Boundary output shape: {outputs['boundary'].shape}")
+        print(f"  Refined output shape: {outputs['refined'].shape}")
+        
+        if 'deep_seg' in outputs:
+            print(f"  Deep supervision outputs: {len(outputs['deep_seg'])} levels")
+        
+        assert outputs['refined'].shape == (2, 1, 400, 400), f"Output shape mismatch"
+    
+    # 測試推論模式
+    model.eval()
+    with torch.no_grad():
+        y = model(x, task_id=0)
+        print(f"\nInference output shape: {y.shape}")
+        assert y.shape == (2, 1, 400, 400)
+    
+    # 測試損失函數
+    print("\n" + "="*60)
+    print("Testing BoundaryAwareLoss...")
+    
+    criterion = BoundaryAwareLoss()
+    
+    model.train()
+    outputs = model(x, task_id=0)
+    targets = torch.randint(0, 2, (2, 1, 400, 400)).float()
+    task_ids = torch.tensor([0, 0])
+    
+    loss, loss_dict = criterion(outputs, targets, task_ids)
+    print(f"Total loss: {loss.item():.4f}")
+    for k, v in loss_dict.items():
+        print(f"  {k}: {v:.4f}")
+    
+    print("\n" + "="*60)
+    print("✓ All tests passed!")
+
+if __name__ == '__main__':
+    test_model()
+
+
+
+"""
+train_multitask_optimized.py
+
+多任務 TransUNet 訓練腳本 - 優化版本
+主要優化：
+1. 按任務分組批量處理（而非逐樣本處理）
+2. 混合精度訓練 (AMP) - 2-3x 加速
+3. 向量化損失計算
+4. 優化的數據加載
+5. 梯度累積支援
+"""
+
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.cuda.amp import autocast, GradScaler
+import yaml
+from pathlib import Path
+import numpy as np
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import json
+import warnings
+warnings.filterwarnings('ignore')
+
+# ============================================================================
+# GPU 記憶體管理工具
+# ============================================================================
+
+def clear_gpu_memory():
+    """徹底清理 GPU 記憶體"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        import gc
+        gc.collect()
+
+def get_gpu_memory_info():
+    """獲取 GPU 記憶體使用情況"""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+        reserved = torch.cuda.memory_reserved() / 1024**3    # GB
+        max_allocated = torch.cuda.max_memory_allocated() / 1024**3
+        return {
+            'allocated': allocated,
+            'reserved': reserved,
+            'max_allocated': max_allocated
+        }
+    return None
+
+def reset_peak_memory():
+    """重置峰值記憶體統計"""
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+# ============================================================================
+# 優化的損失函數（向量化計算，不用 for 迴圈）
+# ============================================================================
+
+class OptimizedBoundaryAwareLoss(nn.Module):
+    """
+    優化的邊界感知損失函數
+    使用向量化操作，避免逐樣本計算
+    
+    任務說明：
+    - Cell (task 0): 分割細胞本體（白色大塊），細胞壁是背景（黑色細線）
+    - Blood (task 1): 分割血球（圓形區塊）
+    - Root (task 2): 分割根系（細長區塊，前景很少）
+    """
+    def __init__(self, boundary_weights=None, foreground_weights=None, 
+                 deep_supervision_weights=None, smooth=1e-5):
+        super().__init__()
+        self.smooth = smooth
+        
+        # 預設權重
+        # Cell: 前景（細胞）很大，不需要太高的前景權重
+        # Root: 前景（根系）很小，需要較高的前景權重
+        self.boundary_weights = boundary_weights or {0: 1.5, 1: 3.0, 2: 5.0}
+        self.foreground_weights = foreground_weights or {0: 0.5, 1: 1.5, 2: 3.0}  # Cell 降低！
+        self.deep_supervision_weights = deep_supervision_weights or [0.4, 0.2, 0.1]
+        
+        # 動態類別權重的上限
+        # Cell: 背景（細胞壁）很少，需要加權背景，但不要太極端
+        # Root: 前景（根系）很少，需要加權前景
+        self.fg_weight_max = {0: 3.0, 1: 5.0, 2: 10.0}
+        
+        # 轉換為 tensor 以便向量化（最多支援 10 個任務）
+        max_tasks = 10
+        self.register_buffer('boundary_weight_tensor', 
+            torch.tensor([self.boundary_weights.get(i, 2.0) for i in range(max_tasks)]))
+        self.register_buffer('foreground_weight_tensor',
+            torch.tensor([self.foreground_weights.get(i, 1.0) for i in range(max_tasks)]))
+        self.register_buffer('fg_weight_max_tensor',
+            torch.tensor([self.fg_weight_max.get(i, 10.0) for i in range(max_tasks)]))
+    
+    def forward(self, outputs, targets, task_ids, boundary_targets=None):
+        """
+        向量化的損失計算
+        """
+        # 處理輸出格式
+        if isinstance(outputs, dict):
+            seg_out = outputs.get('refined', outputs.get('seg'))
+            boundary_out = outputs.get('boundary')
+            deep_segs = outputs.get('deep_seg', [])
+            deep_boundaries = outputs.get('deep_boundary', [])
+        else:
+            seg_out = outputs
+            boundary_out = None
+            deep_segs = []
+            deep_boundaries = []
+        
+        # 生成邊界目標（如果沒有提供）
+        if boundary_targets is None:
+            boundary_targets = self._generate_boundary_targets(targets)
+        
+        total_loss = 0.0
+        loss_dict = {}
+        
+        # 獲取任務權重（向量化）
+        task_weights = self.foreground_weight_tensor[task_ids]  # [B]
+        boundary_task_weights = self.boundary_weight_tensor[task_ids]  # [B]
+        fg_weight_max = self.fg_weight_max_tensor[task_ids]  # [B]
+        
+        # 1. 主分割損失（向量化）
+        seg_loss = self._vectorized_seg_loss(seg_out, targets, task_weights, fg_weight_max)
+        total_loss += seg_loss
+        loss_dict['seg_loss'] = seg_loss.item()
+        
+        # 2. 邊界損失
+        if boundary_out is not None:
+            boundary_loss = self._vectorized_boundary_loss(
+                boundary_out, boundary_targets, boundary_task_weights)
+            total_loss += boundary_loss
+            loss_dict['boundary_loss'] = boundary_loss.item()
+        
+        # 3. 深度監督損失
+        if len(deep_segs) > 0:
+            deep_loss = 0.0
+            for i, ds in enumerate(deep_segs):
+                weight = self.deep_supervision_weights[i] if i < len(self.deep_supervision_weights) else 0.1
+                deep_loss += weight * self._vectorized_seg_loss(ds, targets, task_weights, fg_weight_max)
+                
+                if i < len(deep_boundaries) and deep_boundaries[i] is not None:
+                    deep_loss += weight * 0.5 * self._vectorized_boundary_loss(
+                        deep_boundaries[i], boundary_targets, boundary_task_weights)
+            
+            total_loss += deep_loss
+            loss_dict['deep_loss'] = deep_loss.item()
+        
+        loss_dict['total_loss'] = total_loss.item()
+        
+        return total_loss, loss_dict
+    
+    def _vectorized_seg_loss(self, pred, target, task_weights, fg_weight_max):
+        """
+        向量化的分割損失
+        
+        關鍵改進：雙向類別平衡
+        - 當前景少時（如 Root）：加權前景
+        - 當背景少時（如 Cell 的細胞壁）：加權背景
+        """
+        B = pred.shape[0]
+        
+        # Dice Loss（批量計算）
+        pred_sigmoid = torch.sigmoid(pred).clamp(min=1e-7, max=1-1e-7)
+        pred_flat = pred_sigmoid.view(B, -1)
+        target_flat = target.view(B, -1)
+        
+        intersection = (pred_flat * target_flat).sum(dim=1)
+        union = pred_flat.sum(dim=1) + target_flat.sum(dim=1)
+        dice = (2. * intersection + self.smooth) / (union + self.smooth)
+        dice_loss = (1 - dice)  # [B]
+        
+        # 標準 BCE Loss
+        bce_loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
+        bce_loss = bce_loss.view(B, -1).mean(dim=1)  # [B]
+        
+        # === 雙向類別平衡 BCE ===
+        fg_mask = (target > 0.5).float()
+        bg_mask = 1 - fg_mask
+        fg_count = fg_mask.view(B, -1).sum(dim=1) + 1e-7
+        bg_count = bg_mask.view(B, -1).sum(dim=1) + 1e-7
+        total_count = fg_count + bg_count
+        
+        # 計算前景和背景的比例
+        fg_ratio = fg_count / total_count  # [B]
+        bg_ratio = bg_count / total_count  # [B]
+        
+        # 動態權重：少數類別獲得更高權重
+        # 當 fg_ratio=0.8, bg_ratio=0.2 時：fg_weight=0.2/0.8=0.25, bg_weight=0.8/0.2=4.0
+        # 當 fg_ratio=0.1, bg_ratio=0.9 時：fg_weight=0.9/0.1=9.0, bg_weight=0.1/0.9=0.11
+        fg_weight = torch.clamp(bg_ratio / fg_ratio, min=0.1, max=None)
+        bg_weight = torch.clamp(fg_ratio / bg_ratio, min=0.1, max=None)
+        
+        # 應用任務特定的上限
+        fg_weight = torch.min(fg_weight, fg_weight_max)
+        bg_weight = torch.min(bg_weight, fg_weight_max)  # 背景也用同樣上限
+        
+        # 建立權重圖
+        weight_map = fg_mask * fg_weight.view(B, 1, 1, 1) + bg_mask * bg_weight.view(B, 1, 1, 1)
+        
+        # 加權 BCE
+        weighted_bce = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
+        weighted_bce = (weighted_bce * weight_map).view(B, -1).mean(dim=1)  # [B]
+        
+        # 組合損失，乘以任務權重
+        sample_loss = (dice_loss + bce_loss + weighted_bce) * task_weights
+        
+        return sample_loss.mean()
+    
+    def _vectorized_boundary_loss(self, pred, target, task_weights):
+        """向量化的邊界損失"""
+        B = pred.shape[0]
+        
+        # BCE Loss
+        bce_loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
+        bce_loss = bce_loss.view(B, -1).mean(dim=1)  # [B]
+        
+        # Dice Loss
+        pred_sigmoid = torch.sigmoid(pred).clamp(min=1e-7, max=1-1e-7)
+        pred_flat = pred_sigmoid.view(B, -1)
+        target_flat = target.view(B, -1)
+        
+        intersection = (pred_flat * target_flat).sum(dim=1)
+        union = pred_flat.sum(dim=1) + target_flat.sum(dim=1)
+        dice = (2. * intersection + self.smooth) / (union + self.smooth)
+        dice_loss = (1 - dice)  # [B]
+        
+        sample_loss = (bce_loss + dice_loss) * task_weights
+        
+        return sample_loss.mean()
+    
+    def _generate_boundary_targets(self, targets):
+        """生成邊界目標"""
+        kernel_size = 3
+        targets_float = targets.float()
+        dilated = F.max_pool2d(targets_float, kernel_size, stride=1, padding=kernel_size//2)
+        eroded = -F.max_pool2d(-targets_float, kernel_size, stride=1, padding=kernel_size//2)
+        boundary = dilated - eroded
+        return boundary
+
+
+# ============================================================================
+# 任務平衡採樣器
+# ============================================================================
+
+class TaskBalancedSampler:
+    """
+    任務平衡採樣器
+    確保每個 batch 中包含不同任務的樣本
+    """
+    def __init__(self, dataset, batch_size=4, drop_last=False):
+        """
+        Args:
+            dataset: MultiTaskSegmentationDataset
+            batch_size: batch 大小
+            drop_last: 是否丟棄最後不完整的 batch
+        """
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        
+        # 動態偵測任務數量
+        max_task_id = 0
+        
+        # 先掃描一遍找出所有任務
+        for idx in range(len(dataset.patches)):
+            _, _, task_id = dataset.patches[idx]
+            if task_id > max_task_id:
+                max_task_id = task_id
+        
+        self.num_tasks = max_task_id + 1
+        
+        # 按任務分組索引
+        self.task_indices = {i: [] for i in range(self.num_tasks)}
+        for idx, (_, _, task_id) in enumerate(dataset.patches):
+            self.task_indices[task_id].append(idx)
+        
+        # 計算每個任務的樣本數
+        self.task_counts = {
+            task_id: len(indices) 
+            for task_id, indices in self.task_indices.items()
+        }
+        
+        print(f"TaskBalancedSampler: {self.num_tasks} tasks, counts: {self.task_counts}")
+    
+    def __iter__(self):
+        """產生平衡的 batch 索引"""
+        # 複製索引列表（避免修改原始列表）
+        task_indices_copy = {
+            task_id: list(indices) 
+            for task_id, indices in self.task_indices.items()
+        }
+        
+        # 隨機打亂每個任務的索引
+        for task_id in task_indices_copy:
+            np.random.shuffle(task_indices_copy[task_id])
+        
+        # 當前各任務的指針
+        task_pointers = {task_id: 0 for task_id in range(self.num_tasks)}
+        
+        batch_indices = []
+        
+        while True:
+            # 檢查是否所有任務都已用完
+            all_exhausted = all(
+                task_pointers[task_id] >= len(task_indices_copy[task_id])
+                for task_id in range(self.num_tasks)
+            )
+            if all_exhausted:
+                break
+            
+            # 嘗試從每個任務中取樣
+            for task_id in range(self.num_tasks):
+                if task_pointers[task_id] < len(task_indices_copy[task_id]):
+                    idx = task_indices_copy[task_id][task_pointers[task_id]]
+                    batch_indices.append(idx)
+                    task_pointers[task_id] += 1
+                    
+                    # 當 batch 滿了，返回
+                    if len(batch_indices) == self.batch_size:
+                        yield batch_indices
+                        batch_indices = []
+        
+        # 處理剩餘的樣本
+        if len(batch_indices) > 0 and not self.drop_last:
+            yield batch_indices
+    
+    def __len__(self):
+        """計算總 batch 數"""
+        total_samples = sum(self.task_counts.values())
+        if self.drop_last:
+            return total_samples // self.batch_size
+        else:
+            return (total_samples + self.batch_size - 1) // self.batch_size
+
+
+# ============================================================================
+# 優化的訓練器
+# ============================================================================
+
+class OptimizedMultiTaskTrainer:
+    """
+    優化的多任務訓練器
+    
+    主要優化：
+    1. 按任務分組批量處理
+    2. 混合精度訓練 (AMP)
+    3. 梯度累積
+    4. 優化的數據加載
+    """
+    
+    def __init__(self, config_path='configs/default.yaml'):
+        # 載入配置
+        self.config = self._load_config(config_path)
+        
+        # 設置設備
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Using device: {self.device}")
+        
+        if torch.cuda.is_available():
+            print(f"GPU: {torch.cuda.get_device_name(0)}")
+            print(f"CUDA Version: {torch.version.cuda}")
+            # 啟用 cudnn benchmark 以加速
+            torch.backends.cudnn.benchmark = True
+        
+        # 任務配置
+        self.num_tasks = self.config.get('num_tasks', 3)
+        self.task_names = self.config.get('task_names', {0: 'Cell', 1: 'Blood', 2: 'Root'})
+        if isinstance(self.task_names, list):
+            self.task_names = {i: name for i, name in enumerate(self.task_names)}
+        
+        # 需要反轉 mask 的任務
+        # Cell 任務：原本細胞壁(線條)是白色，反轉後細胞區塊變成白色
+        self.invert_mask_tasks = set(self.config.get('invert_mask_tasks', []))  # 預設不反轉
+        
+        # 混合精度訓練
+        self.use_amp = self.config.get('use_amp', True) and torch.cuda.is_available()
+        self.scaler = GradScaler() if self.use_amp else None
+        
+        # 梯度累積
+        self.gradient_accumulation_steps = self.config.get('gradient_accumulation_steps', 1)
+        
+        print(f"\n{'='*60}")
+        print(f"Training Configuration:")
+        print(f"  Number of tasks: {self.num_tasks}")
+        print(f"  Mixed Precision (AMP): {self.use_amp}")
+        print(f"  Gradient Accumulation Steps: {self.gradient_accumulation_steps}")
+        if self.invert_mask_tasks:
+            print(f"  Invert mask tasks: {self.invert_mask_tasks}")
+            print(f"    → Cell task will detect cell regions (white) instead of cell walls")
+        print(f"{'='*60}")
+        
+        # 創建輸出目錄
+        self.output_dir = Path('outputs')
+        self.model_dir = self.output_dir / 'models'
+        self.pred_dir = self.output_dir / 'predictions'
+        self.model_dir.mkdir(parents=True, exist_ok=True)
+        self.pred_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 訓練歷史
+        self.history = {
+            'train_loss': [], 'val_loss': [],
+            'val_iou': [], 'val_dice': [],
+            'task_metrics': {i: [] for i in range(self.num_tasks)},
+            'loss_components': {'train': [], 'val': []}
+        }
+        
+        # 初始化
+        self._init_model()
+        self._init_data()
+        self._init_optimizer()
+    
+    def _load_config(self, config_path):
+        """載入配置"""
+        if not os.path.exists(config_path):
+            print(f"Config not found: {config_path}, using defaults")
+            return self._default_config()
+        
+        with open(config_path, 'r', encoding='utf-8') as f:
+            return yaml.safe_load(f)
+    
+    def _default_config(self):
+        """預設配置"""
+        return {
+            'batch_size': 4,
+            'epochs': 200,
+            'lr': 1e-5,
+            'patch_size': 400,
+            'num_decoder_conv_layers': 80,
+            'data_path': 'data/',
+            'task_structure': 'subfolder',
+            'num_tasks': 3,
+            'use_amp': True,  # 混合精度訓練
+            'gradient_accumulation_steps': 1,
+            'num_workers': 4,  # DataLoader workers
+            'gpu_cache_clear_freq': 50,  # 每多少個 batch 清理一次 GPU 記憶體
+            # Cell: 前景是細胞本體（大塊），背景是細胞壁（細線）
+            # Blood: 前景是血球（圓形區塊）
+            # Root: 前景是根系（細長，前景很少）
+            'boundary_weights': {0: 1.5, 1: 3.0, 2: 5.0},
+            'foreground_weights': {0: 0.5, 1: 1.5, 2: 3.0},  # Cell 前景大，權重要低
+            'use_deep_supervision': True,
+        }
+    
+    def _init_model(self):
+        """初始化模型"""
+        print("\nInitializing model...")
+        
+        # 嘗試導入模型
+        try:
+            from model_multitask_boundaryversion import MultiTaskTransUNet
+            print("  ✓ Using boundary-aware model")
+        except ImportError:
+            try:
+                from model_multitask import MultiTaskTransUNet
+                print("  ✓ Using original model")
+            except ImportError:
+                raise ImportError("Cannot find model_multitask.py or model_multitask_boundaryversion.py")
+        
+        self.model = MultiTaskTransUNet(
+            img_size=self.config['patch_size'],
+            patch_size=16,
+            in_channels=3,
+            num_classes=1,
+            embed_dim=768,
+            depth=12,
+            num_heads=12,
+            mlp_ratio=4,
+            num_decoder_layers=self.config['num_decoder_conv_layers'],
+            num_tasks=self.num_tasks,
+            task_embed_dim=256,
+            use_deep_supervision=self.config.get('use_deep_supervision', True)
+        ).to(self.device)
+        
+        # 參數統計
+        total_params = sum(p.numel() for p in self.model.parameters())
+        print(f"  Total parameters: {total_params:,}")
+        
+        # 載入預訓練權重
+        self._load_pretrained_weights()
+    
+    def _load_pretrained_weights(self):
+        """載入預訓練權重"""
+        pretrained_path = self.config.get('pretrained_model_path')
+        if pretrained_path and Path(pretrained_path).exists():
+            print(f"Loading pretrained weights from: {pretrained_path}")
+            try:
+                state_dict = torch.load(pretrained_path, map_location=self.device)
+                if 'model_state_dict' in state_dict:
+                    state_dict = state_dict['model_state_dict']
+                
+                # 部分載入
+                model_dict = self.model.state_dict()
+                matched = {k: v for k, v in state_dict.items() 
+                          if k in model_dict and v.shape == model_dict[k].shape}
+                model_dict.update(matched)
+                self.model.load_state_dict(model_dict)
+                print(f"  ✓ Loaded {len(matched)}/{len(model_dict)} layers")
+            except Exception as e:
+                print(f"  ✗ Failed to load: {e}")
+    
+    def _init_data(self):
+        """初始化數據載入器"""
+        print("\nInitializing datasets...")
+        
+        from dataset_multitask import MultiTaskSegmentationDataset
+        
+        # 訓練集
+        self.train_dataset = MultiTaskSegmentationDataset(
+            data_root=self.config['data_path'],
+            mode='train',
+            patch_size=self.config['patch_size'],
+            task_structure=self.config.get('task_structure', 'subfolder')
+        )
+        
+        # 驗證集
+        self.val_dataset = MultiTaskSegmentationDataset(
+            data_root=self.config['data_path'],
+            mode='val',
+            patch_size=self.config['patch_size'],
+            task_structure=self.config.get('task_structure', 'subfolder')
+        )
+        
+        # 任務平衡採樣器
+        train_sampler = TaskBalancedSampler(
+            self.train_dataset,
+            batch_size=self.config['batch_size'],
+            drop_last=True
+        )
+        
+        num_workers = self.config.get('num_workers', 4)
+        
+        # 數據載入器（優化配置）
+        self.train_loader = DataLoader(
+            self.train_dataset,
+            batch_sampler=train_sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=True if num_workers > 0 else False,  # 保持 workers 存活
+            prefetch_factor=2 if num_workers > 0 else None  # 預取
+        )
+        
+        self.val_loader = DataLoader(
+            self.val_dataset,
+            batch_size=self.config['batch_size'],
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=True if num_workers > 0 else False
+        )
+        
+        print(f"  Train batches: {len(self.train_loader)}")
+        print(f"  Val batches: {len(self.val_loader)}")
+    
+    def _init_optimizer(self):
+        """初始化優化器"""
+        self.optimizer = AdamW(
+            self.model.parameters(),
+            lr=self.config['lr'],
+            weight_decay=0.01
+        )
+        
+        self.scheduler = CosineAnnealingWarmRestarts(
+            self.optimizer, T_0=20, T_mult=2, eta_min=1e-7
+        )
+        
+        # 損失函數
+        self.criterion = OptimizedBoundaryAwareLoss(
+            boundary_weights=self.config.get('boundary_weights', {0: 1.5, 1: 3.0, 2: 5.0}),
+            foreground_weights=self.config.get('foreground_weights', {0: 0.5, 1: 1.5, 2: 3.0}),
+            deep_supervision_weights=self.config.get('deep_supervision_weights', [0.4, 0.2, 0.1]),
+        ).to(self.device)
+        
+        print(f"  ✓ Optimizer and loss function initialized")
+    
+    def _invert_masks_for_tasks(self, masks, task_ids):
+        """
+        反轉指定任務的 mask
+        
+        用於 Cell 任務：
+        - 原本：細胞壁是白色(1)，細胞內部是黑色(0)
+        - 反轉後：細胞區塊是白色(1)，細胞壁是黑色(0)
+        
+        這樣 Cell 任務就變成區塊狀目標，可以正常使用邊界損失
+        """
+        if not self.invert_mask_tasks:
+            return masks
+        
+        # 複製 masks 以避免修改原始數據
+        masks = masks.clone()
+        
+        for task_id in self.invert_mask_tasks:
+            # 找出這個任務的樣本
+            task_mask = (task_ids == task_id)
+            if task_mask.any():
+                # 反轉這些樣本的 mask: 1 → 0, 0 → 1
+                masks[task_mask] = 1.0 - masks[task_mask]
+        
+        return masks
+    
+    def _batch_forward_by_task(self, images, task_ids):
+        """
+        按任務分組批量前向傳播
+        這是關鍵優化：避免逐樣本處理
+        """
+        batch_size = images.shape[0]
+        unique_tasks = torch.unique(task_ids)
+        
+        # 如果只有一個任務，直接批量處理
+        if len(unique_tasks) == 1:
+            return self.model(images, task_id=unique_tasks[0].item())
+        
+        # 多個任務：按任務分組處理，然後重新排列
+        outputs_dict = {}
+        task_indices = {}
+        
+        # 分組
+        for task in unique_tasks:
+            mask = (task_ids == task)
+            task_indices[task.item()] = mask
+            task_images = images[mask]
+            
+            if task_images.shape[0] > 0:
+                task_output = self.model(task_images, task_id=task.item())
+                outputs_dict[task.item()] = task_output
+        
+        # 重新組合輸出（保持原始順序）
+        first_output = list(outputs_dict.values())[0]
+        
+        if isinstance(first_output, dict):
+            # 字典輸出
+            combined = {}
+            for key in first_output.keys():
+                if isinstance(first_output[key], torch.Tensor):
+                    # 創建空 tensor
+                    shape = list(first_output[key].shape)
+                    shape[0] = batch_size
+                    combined_tensor = torch.zeros(shape, device=images.device, dtype=first_output[key].dtype)
+                    
+                    # 填充各任務的結果
+                    for task, indices in task_indices.items():
+                        if task in outputs_dict:
+                            combined_tensor[indices] = outputs_dict[task][key]
+                    
+                    combined[key] = combined_tensor
+                elif isinstance(first_output[key], list):
+                    # 深度監督列表
+                    combined_list = []
+                    for i in range(len(first_output[key])):
+                        shape = list(first_output[key][i].shape)
+                        shape[0] = batch_size
+                        combined_tensor = torch.zeros(shape, device=images.device, dtype=first_output[key][i].dtype)
+                        
+                        for task, indices in task_indices.items():
+                            if task in outputs_dict:
+                                combined_tensor[indices] = outputs_dict[task][key][i]
+                        
+                        combined_list.append(combined_tensor)
+                    combined[key] = combined_list
+            
+            return combined
+        else:
+            # Tensor 輸出
+            shape = list(first_output.shape)
+            shape[0] = batch_size
+            combined = torch.zeros(shape, device=images.device, dtype=first_output.dtype)
+            
+            for task, indices in task_indices.items():
+                if task in outputs_dict:
+                    combined[indices] = outputs_dict[task]
+            
+            return combined
+    
+    def train_epoch(self, epoch):
+        """訓練一個 epoch（優化版，加入 OOM 處理）"""
+        self.model.train()
+        total_loss = 0.0
+        loss_components = {}
+        num_batches = 0
+        
+        # Epoch 開始前清理記憶體
+        clear_gpu_memory()
+        
+        pbar = tqdm(self.train_loader, desc=f'Epoch {epoch+1}/{self.config["epochs"]}')
+        
+        self.optimizer.zero_grad(set_to_none=True)  # 更高效的梯度清零
+        
+        for batch_idx, batch in enumerate(pbar):
+            try:
+                images, masks, task_ids = batch[:3]
+                images = images.to(self.device, non_blocking=True)
+                masks = masks.to(self.device, non_blocking=True)
+                task_ids = task_ids.to(self.device, non_blocking=True)
+                
+                # 反轉指定任務的 mask（例如 Cell: 細胞壁→細胞區塊）
+                masks = self._invert_masks_for_tasks(masks, task_ids)
+                
+                # 混合精度前向傳播
+                with autocast(enabled=self.use_amp):
+                    # 按任務分組批量處理
+                    outputs = self._batch_forward_by_task(images, task_ids)
+                    
+                    # 計算損失
+                    loss, loss_dict = self.criterion(outputs, masks, task_ids)
+                    loss = loss / self.gradient_accumulation_steps
+                
+                # 反向傳播
+                if self.use_amp:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+                
+                # 梯度累積
+                if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+                    if self.use_amp:
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                        self.optimizer.step()
+                    
+                    self.optimizer.zero_grad(set_to_none=True)
+                
+                # 記錄損失（在清理前提取數值）
+                loss_value = loss.item() * self.gradient_accumulation_steps
+                total_loss += loss_value
+                num_batches += 1
+                
+                for key, value in loss_dict.items():
+                    if key not in loss_components:
+                        loss_components[key] = 0.0
+                    loss_components[key] += value
+                
+                # 明確刪除不需要的變量，釋放記憶體
+                del outputs, loss, loss_dict
+                del images, masks, task_ids
+                
+                # 更新進度條
+                pbar.set_postfix({
+                    'loss': f'{loss_value:.4f}',
+                    'lr': f'{self.optimizer.param_groups[0]["lr"]:.2e}'
+                })
+                
+                # 定期清理 GPU 記憶體（更頻繁）
+                cache_clear_freq = self.config.get('gpu_cache_clear_freq', 30)
+                if (batch_idx + 1) % cache_clear_freq == 0:
+                    clear_gpu_memory()
+                    
+            except RuntimeError as e:
+                if 'out of memory' in str(e).lower():
+                    print(f"\n⚠ OOM at batch {batch_idx}, clearing memory and skipping...")
+                    # 清理所有可能的變量
+                    if 'outputs' in locals(): del outputs
+                    if 'loss' in locals(): del loss
+                    if 'images' in locals(): del images
+                    if 'masks' in locals(): del masks
+                    clear_gpu_memory()
+                    self.optimizer.zero_grad(set_to_none=True)
+                    continue
+                else:
+                    raise e
+        
+        # Epoch 結束時徹底清理
+        clear_gpu_memory()
+        
+        # 學習率更新
+        self.scheduler.step()
+        
+        # 計算平均損失
+        if num_batches > 0:
+            avg_loss = total_loss / num_batches
+            avg_components = {k: v / num_batches for k, v in loss_components.items()}
+        else:
+            avg_loss = 0.0
+            avg_components = {}
+        
+        return avg_loss, avg_components
+    
+    @torch.no_grad()
+    def validate(self, epoch):
+        """驗證（優化版，加入更好的記憶體管理）"""
+        # 驗證前徹底清理 GPU 記憶體
+        clear_gpu_memory()
+        
+        self.model.eval()
+        total_loss = 0.0
+        loss_components = {}
+        all_preds = []
+        all_targets = []
+        all_task_ids = []
+        
+        # 收集每個任務的樣本用於視覺化
+        task_samples = {i: None for i in range(self.num_tasks)}
+        
+        for batch_idx, batch in enumerate(tqdm(self.val_loader, desc='Validating')):
+            images, masks, task_ids = batch[:3]
+            images = images.to(self.device, non_blocking=True)
+            masks = masks.to(self.device, non_blocking=True)
+            task_ids = task_ids.to(self.device, non_blocking=True)
+            
+            # 反轉指定任務的 mask（與訓練時一致）
+            masks = self._invert_masks_for_tasks(masks, task_ids)
+            
+            with autocast(enabled=self.use_amp):
+                outputs = self._batch_forward_by_task(images, task_ids)
+                loss, loss_dict = self.criterion(outputs, masks, task_ids)
+            
+            total_loss += loss.item()
+            
+            for key, value in loss_dict.items():
+                if key not in loss_components:
+                    loss_components[key] = 0.0
+                loss_components[key] += value
+            
+            # 收集預測結果
+            if isinstance(outputs, dict):
+                seg_out = outputs.get('refined', outputs.get('seg'))
+            else:
+                seg_out = outputs
+            
+            # 立即轉移到 CPU 並刪除 GPU 上的變量
+            pred_cpu = torch.sigmoid(seg_out).cpu()
+            masks_cpu = masks.cpu()
+            task_ids_cpu = task_ids.cpu()
+            
+            all_preds.append(pred_cpu)
+            all_targets.append(masks_cpu)
+            all_task_ids.append(task_ids_cpu)
+            
+            # 收集每個任務的第一個樣本用於視覺化
+            batch_size = images.shape[0]
+            for i in range(batch_size):
+                task_id = task_ids_cpu[i].item()
+                if task_id < self.num_tasks and task_samples.get(task_id) is None:
+                    task_samples[task_id] = {
+                        'image': images[i:i+1].cpu(),
+                        'mask': masks_cpu[i:i+1],
+                        'pred': seg_out[i:i+1].cpu(),
+                        'task_id': task_id
+                    }
+            
+            # 明確刪除 GPU 變量
+            del outputs, loss, seg_out, images, masks, task_ids
+            
+            # 定期清理 GPU 記憶體
+            cache_clear_freq = self.config.get('gpu_cache_clear_freq', 30)
+            if (batch_idx + 1) % cache_clear_freq == 0:
+                clear_gpu_memory()
+        
+        # 驗證結束徹底清理
+        clear_gpu_memory()
+        
+        # 計算指標
+        all_preds = torch.cat(all_preds, dim=0)
+        all_targets = torch.cat(all_targets, dim=0)
+        all_task_ids = torch.cat(all_task_ids, dim=0)
+        
+        metrics = self._compute_metrics(all_preds, all_targets, all_task_ids)
+        
+        avg_loss = total_loss / len(self.val_loader)
+        avg_components = {k: v / len(self.val_loader) for k, v in loss_components.items()}
+        
+        # 列印驗證結果
+        print(f"\nValidation Loss: {avg_loss:.4f}")
+        print(f"Overall IoU: {metrics['overall']['iou']:.4f}, Dice: {metrics['overall']['dice']:.4f}")
+        for task_id in range(self.num_tasks):
+            task_name = self.task_names.get(task_id, f'Task_{task_id}')
+            if metrics[task_id]['count'] > 0:
+                print(f"  {task_name}: IoU={metrics[task_id]['iou']:.4f}, Dice={metrics[task_id]['dice']:.4f}")
+        
+        # 保存視覺化樣本（每 10 個 epoch 或最後一個 epoch）
+        if epoch % 10 == 0 or epoch == self.config['epochs'] - 1:
+            self._save_validation_samples(task_samples, epoch)
+        
+        return avg_loss, metrics, avg_components, task_samples
+    
+    def _compute_metrics(self, preds, targets, task_ids, threshold=0.5):
+        """計算分割指標"""
+        preds_binary = (preds > threshold).float()
+        
+        metrics = {
+            'overall': {'iou': 0, 'dice': 0, 'count': 0}
+        }
+        for i in range(self.num_tasks):
+            metrics[i] = {'iou': 0, 'dice': 0, 'count': 0}
+        
+        for task_id in range(self.num_tasks):
+            mask = (task_ids == task_id)
+            if mask.sum() == 0:
+                continue
+            
+            task_preds = preds_binary[mask]
+            task_targets = targets[mask]
+            
+            # IoU
+            intersection = (task_preds * task_targets).sum()
+            union = task_preds.sum() + task_targets.sum() - intersection
+            iou = (intersection + 1e-7) / (union + 1e-7)
+            
+            # Dice
+            dice = (2 * intersection + 1e-7) / (task_preds.sum() + task_targets.sum() + 1e-7)
+            
+            metrics[task_id]['iou'] = iou.item()
+            metrics[task_id]['dice'] = dice.item()
+            metrics[task_id]['count'] = mask.sum().item()
+        
+        # Overall
+        intersection = (preds_binary * targets).sum()
+        union = preds_binary.sum() + targets.sum() - intersection
+        metrics['overall']['iou'] = ((intersection + 1e-7) / (union + 1e-7)).item()
+        metrics['overall']['dice'] = ((2 * intersection + 1e-7) / (preds_binary.sum() + targets.sum() + 1e-7)).item()
+        metrics['overall']['count'] = len(preds)
+        
+        return metrics
+    
+    def _save_validation_samples(self, task_samples, epoch):
+        """保存驗證樣本的視覺化"""
+        try:
+            nrows = self.num_tasks
+            ncols = 3
+            
+            fig, axes = plt.subplots(nrows, ncols, figsize=(15, 5 * nrows))
+            
+            # 如果只有一個任務，確保 axes 是 2D
+            if nrows == 1:
+                axes = axes.reshape(1, -1)
+            
+            for task_id in range(self.num_tasks):
+                task_name = self.task_names.get(task_id, f'Task_{task_id}')
+                sample = task_samples.get(task_id)
+                
+                if sample is None:
+                    # 沒有這個任務的樣本
+                    for col in range(3):
+                        axes[task_id, col].text(
+                            0.5, 0.5, 
+                            f'⚠ No {task_name} samples\nin validation set', 
+                            ha='center', va='center', fontsize=14, color='red',
+                            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+                        )
+                        axes[task_id, col].set_xlim(0, 1)
+                        axes[task_id, col].set_ylim(0, 1)
+                        axes[task_id, col].axis('off')
+                    
+                    axes[task_id, 0].set_title(f'{task_name} - Image', fontsize=12, fontweight='bold')
+                    axes[task_id, 1].set_title(f'{task_name} - Ground Truth', fontsize=12, fontweight='bold')
+                    axes[task_id, 2].set_title(f'{task_name} - Prediction', fontsize=12, fontweight='bold')
+                    continue
+                
+                # 原始影像
+                img = sample['image'][0].permute(1, 2, 0).numpy()
+                # 確保影像值在 [0, 1] 範圍內
+                img = np.clip(img, 0, 1)
+                axes[task_id, 0].imshow(img)
+                axes[task_id, 0].set_title(f'{task_name} - Image', fontsize=12, fontweight='bold')
+                axes[task_id, 0].axis('off')
+                
+                # 真實標籤
+                mask = sample['mask'][0, 0].numpy()
+                axes[task_id, 1].imshow(mask, cmap='gray', vmin=0, vmax=1)
+                axes[task_id, 1].set_title(f'{task_name} - Ground Truth', fontsize=12, fontweight='bold')
+                axes[task_id, 1].axis('off')
+                
+                # 預測結果（顯示概率熱圖）
+                pred = torch.sigmoid(sample['pred'][0, 0]).numpy()
+                
+                # 使用 jet colormap 讓預測結果更明顯
+                im = axes[task_id, 2].imshow(pred, cmap='jet', vmin=0, vmax=1)
+                axes[task_id, 2].set_title(
+                    f'{task_name} - Prediction\n(min: {pred.min():.3f}, max: {pred.max():.3f}, mean: {pred.mean():.3f})', 
+                    fontsize=10, fontweight='bold'
+                )
+                axes[task_id, 2].axis('off')
+                
+                # 添加 colorbar
+                cbar = plt.colorbar(im, ax=axes[task_id, 2], fraction=0.046, pad=0.04)
+                cbar.set_label('Probability', rotation=270, labelpad=15)
+            
+            plt.suptitle(f'Validation Results - Epoch {epoch}', fontsize=16, fontweight='bold', y=0.995)
+            plt.tight_layout()
+            
+            # 確保輸出目錄存在
+            self.pred_dir.mkdir(parents=True, exist_ok=True)
+            
+            save_path = self.pred_dir / f'val_epoch{epoch:03d}.png'
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            plt.close()
+            
+            print(f"✓ Saved validation visualization to {save_path}")
+            
+        except Exception as e:
+            print(f"⚠ Error saving validation samples: {e}")
+            import traceback
+            traceback.print_exc()
+            plt.close('all')
+    
+    def plot_history(self):
+        """繪製訓練歷史"""
+        try:
+            # 檢查是否有數據可以繪製
+            if len(self.history['train_loss']) == 0:
+                print("⚠ No training history to plot yet")
+                return
+            
+            fig, axes = plt.subplots(2, 3, figsize=(20, 12))
+            
+            # 損失曲線
+            axes[0, 0].plot(self.history['train_loss'], label='Train Loss', linewidth=2)
+            axes[0, 0].plot(self.history['val_loss'], label='Val Loss', linewidth=2)
+            axes[0, 0].set_xlabel('Epoch')
+            axes[0, 0].set_ylabel('Loss')
+            axes[0, 0].set_title('Training and Validation Loss', fontsize=14, fontweight='bold')
+            axes[0, 0].legend()
+            axes[0, 0].grid(True, alpha=0.3)
+            
+            # IoU 曲線
+            if len(self.history['val_iou']) > 0:
+                axes[0, 1].plot(self.history['val_iou'], label='Overall IoU', linewidth=2, color='green')
+            axes[0, 1].set_xlabel('Epoch')
+            axes[0, 1].set_ylabel('IoU')
+            axes[0, 1].set_title('Validation IoU', fontsize=14, fontweight='bold')
+            axes[0, 1].legend()
+            axes[0, 1].grid(True, alpha=0.3)
+            
+            # Dice 曲線
+            if len(self.history['val_dice']) > 0:
+                axes[0, 2].plot(self.history['val_dice'], label='Overall Dice', linewidth=2, color='orange')
+            axes[0, 2].set_xlabel('Epoch')
+            axes[0, 2].set_ylabel('Dice')
+            axes[0, 2].set_title('Validation Dice', fontsize=14, fontweight='bold')
+            axes[0, 2].legend()
+            axes[0, 2].grid(True, alpha=0.3)
+            
+            # 各任務 IoU
+            for task_id in range(self.num_tasks):
+                task_name = self.task_names.get(task_id, f'Task_{task_id}')
+                if task_id in self.history['task_metrics'] and len(self.history['task_metrics'][task_id]) > 0:
+                    task_ious = [m.get('iou', 0) for m in self.history['task_metrics'][task_id]]
+                    axes[1, 0].plot(task_ious, label=f'{task_name} IoU', linewidth=1.5)
+            
+            axes[1, 0].set_xlabel('Epoch')
+            axes[1, 0].set_ylabel('IoU')
+            axes[1, 0].set_title('Task-specific IoU', fontsize=14, fontweight='bold')
+            axes[1, 0].legend()
+            axes[1, 0].grid(True, alpha=0.3)
+            
+            # 損失分量
+            if 'loss_components' in self.history and len(self.history['loss_components']['train']) > 0:
+                train_components = self.history['loss_components']['train']
+                if len(train_components) > 0 and isinstance(train_components[0], dict):
+                    component_keys = list(train_components[0].keys())
+                    
+                    for key in component_keys:
+                        if key != 'total_loss':
+                            train_values = [comp.get(key, 0) for comp in train_components]
+                            if len(train_values) > 0 and any(v != 0 for v in train_values):
+                                axes[1, 1].plot(train_values, label=f'{key}', alpha=0.7, linewidth=1)
+                    
+                    axes[1, 1].set_xlabel('Epoch')
+                    axes[1, 1].set_ylabel('Loss')
+                    axes[1, 1].set_title('Training Loss Components', fontsize=14, fontweight='bold')
+                    axes[1, 1].legend()
+                    axes[1, 1].grid(True, alpha=0.3)
+            
+            # 訓練資訊摘要
+            axes[1, 2].axis('off')
+            info_text = f"Model: Boundary-Aware MultiTaskTransUNet\n"
+            info_text += f"Tasks: {self.num_tasks}\n"
+            info_text += f"AMP: {self.use_amp}\n"
+            info_text += f"Epochs completed: {len(self.history['train_loss'])}\n"
+            if len(self.history['val_iou']) > 0:
+                info_text += f"Best IoU: {max(self.history['val_iou']):.4f}\n"
+                info_text += f"Final Train Loss: {self.history['train_loss'][-1]:.4f}\n"
+                info_text += f"Final Val Loss: {self.history['val_loss'][-1]:.4f}"
+            
+            axes[1, 2].text(0.1, 0.5, info_text, fontsize=12, 
+                           verticalalignment='center',
+                           bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            
+            plt.suptitle('Training History - Boundary-Aware MultiTaskTransUNet', 
+                        fontsize=16, fontweight='bold', y=0.98)
+            plt.tight_layout()
+            
+            # 確保輸出目錄存在
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            
+            save_path = self.output_dir / 'training_history.png'
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            plt.close()
+            
+            print(f"✓ Saved training history plot to {save_path}")
+            
+        except Exception as e:
+            print(f"⚠ Error plotting training history: {e}")
+            import traceback
+            traceback.print_exc()
+            plt.close('all')  # 確保關閉所有圖形
+    
+    def _save_history_json(self):
+        """保存訓練歷史為 JSON"""
+        history_json_path = self.output_dir / 'training_history.json'
+        try:
+            history_to_save = {
+                'train_loss': [float(x) for x in self.history['train_loss']],
+                'val_loss': [float(x) for x in self.history['val_loss']],
+                'val_iou': [float(x) for x in self.history['val_iou']],
+                'val_dice': [float(x) for x in self.history['val_dice']],
+                'task_metrics': {},
+                'num_tasks': self.num_tasks,
+                'task_names': self.task_names,
+                'config': {k: v for k, v in self.config.items() if not callable(v)}
+            }
+            
+            # 保存各任務的指標
+            for task_id, metrics_list in self.history['task_metrics'].items():
+                history_to_save['task_metrics'][str(task_id)] = [
+                    {k: float(v) if isinstance(v, (int, float)) else v for k, v in m.items()}
+                    for m in metrics_list
+                ]
+            
+            with open(history_json_path, 'w', encoding='utf-8') as f:
+                json.dump(history_to_save, f, indent=2, ensure_ascii=False)
+            
+            print(f"✓ Training history saved to: {history_json_path}")
+        except Exception as e:
+            print(f"⚠ Warning: Failed to save training history as JSON: {e}")
+    
+    def train(self):
+        """主訓練循環"""
+        print(f"\n{'='*60}")
+        print(f"Starting Optimized Multi-Task Training")
+        print(f"  AMP: {self.use_amp}")
+        print(f"  Gradient Accumulation: {self.gradient_accumulation_steps}")
+        print(f"  GPU Cache Clear Freq: {self.config.get('gpu_cache_clear_freq', 30)} batches")
+        print(f"{'='*60}\n")
+        
+        best_val_iou = 0.0
+        
+        for epoch in range(self.config['epochs']):
+            # 每個 epoch 開始前徹底清理記憶體
+            clear_gpu_memory()
+            reset_peak_memory()
+            
+            # 顯示 GPU 記憶體狀態（每 10 個 epoch）
+            if epoch % 10 == 0:
+                mem_info = get_gpu_memory_info()
+                if mem_info:
+                    print(f"\n[GPU Memory] Allocated: {mem_info['allocated']:.2f}GB, "
+                          f"Reserved: {mem_info['reserved']:.2f}GB")
+            
+            # 訓練
+            train_loss, train_components = self.train_epoch(epoch)
+            self.history['train_loss'].append(train_loss)
+            self.history['loss_components']['train'].append(train_components)
+            
+            # 訓練後清理
+            clear_gpu_memory()
+            
+            # 驗證（返回 4 個值：loss, metrics, components, task_samples）
+            val_loss, val_metrics, val_components, _ = self.validate(epoch)
+            self.history['val_loss'].append(val_loss)
+            self.history['val_iou'].append(val_metrics['overall']['iou'])
+            self.history['val_dice'].append(val_metrics['overall']['dice'])
+            self.history['loss_components']['val'].append(val_components)
+            
+            # 各任務指標
+            for task_id in range(self.num_tasks):
+                self.history['task_metrics'][task_id].append(val_metrics.get(task_id, {'iou': 0, 'dice': 0}))
+            
+            # 保存最佳模型
+            if val_metrics['overall']['iou'] > best_val_iou:
+                best_val_iou = val_metrics['overall']['iou']
+                torch.save(self.model.state_dict(), self.model_dir / 'best_model.pth')
+                print(f"✓ Best model saved (IoU: {best_val_iou:.4f})")
+            
+            # 定期保存檢查點
+            if (epoch + 1) % 20 == 0:
+                # 保存前清理記憶體
+                clear_gpu_memory()
+                
+                checkpoint = {
+                    'epoch': epoch,
+                    'model_state_dict': self.model.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'scheduler_state_dict': self.scheduler.state_dict(),
+                    'history': self.history,
+                    'num_tasks': self.num_tasks,
+                    'task_names': self.task_names,
+                    'config': self.config
+                }
+                torch.save(checkpoint, self.model_dir / f'checkpoint_epoch{epoch+1:03d}.pth')
+                print(f"✓ Checkpoint saved at epoch {epoch+1}")
+            
+            # 定期繪製訓練歷史（第一個 epoch 也畫，方便確認程式運行）
+            if (epoch + 1) % 10 == 0 or epoch == 0:
+                self.plot_history()
+            
+            # 每個 epoch 結束後徹底清理記憶體
+            clear_gpu_memory()
+        
+        # 保存最終模型
+        torch.save(self.model.state_dict(), self.model_dir / 'final_model.pth')
+        
+        # 最終繪製訓練歷史
+        self.plot_history()
+        
+        # 保存訓練歷史為 JSON
+        print(f"\n{'='*60}")
+        print("Saving training history...")
+        self._save_history_json()
+        print(f"{'='*60}")
+        
+        print(f"\n{'='*60}")
+        print(f"Training Completed!")
+        print(f"Number of tasks: {self.num_tasks}")
+        print(f"Best Validation IoU: {best_val_iou:.4f}")
+        print(f"{'='*60}\n")
+
+
+# ============================================================================
+# 主程式
+# ============================================================================
+
+def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Train Multi-Task TransUNet (Optimized)')
+    parser.add_argument('--config', type=str, default='configs/default.yaml')
+    args = parser.parse_args()
+    
+    trainer = OptimizedMultiTaskTrainer(config_path=args.config)
+    trainer.train()
+
+
+if __name__ == '__main__':
+    main()
+
+#=======================================
+#
+# config_training_ui.yaml
+#
+#=======================================
+
+
+batch_size: 4
+boundary_weights:
+  0: 2.0
+  1: 3.0
+  2: 5.0
+data_path: data/
+epochs: 200
+foreground_weights:
+  0: 1.0
+  1: 1.5
+  2: 3.0
+gpu_cache_clear_freq: 20
+gradient_accumulation_steps: 2
+invert_mask_tasks: []
+lr: 1.0e-05
+num_decoder_conv_layers: 80
+num_tasks: 3
+patch_size: 400
+task_structure: subfolder
+use_amp: true
