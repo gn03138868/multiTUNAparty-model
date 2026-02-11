@@ -67,7 +67,7 @@ class OptimizedBoundaryAwareLoss(nn.Module):
     任務說明：
     - Cell (task 0): 分割細胞本體（白色大塊），細胞壁是背景（黑色細線）
     - Blood (task 1): 分割血球（圓形區塊）
-    - Root (task 2): 分割根系（細長區塊，前景很少）
+    - Other (task 2): 其他任務（通用分割）
     """
     def __init__(self, boundary_weights=None, foreground_weights=None, 
                  deep_supervision_weights=None, smooth=1e-5):
@@ -76,15 +76,15 @@ class OptimizedBoundaryAwareLoss(nn.Module):
         
         # 預設權重
         # Cell: 前景（細胞）很大，不需要太高的前景權重
-        # Root: 前景（根系）很小，需要較高的前景權重
-        self.boundary_weights = boundary_weights or {0: 1.5, 1: 3.0, 2: 5.0}
-        self.foreground_weights = foreground_weights or {0: 0.5, 1: 1.5, 2: 3.0}  # Cell 降低！
+        # Other: 通用預設，可視資料特性調整
+        self.boundary_weights = boundary_weights or {0: 1.5, 1: 3.0, 2: 3.0}
+        self.foreground_weights = foreground_weights or {0: 0.5, 1: 1.5, 2: 1.5}  # Cell 降低！
         self.deep_supervision_weights = deep_supervision_weights or [0.4, 0.2, 0.1]
         
         # 動態類別權重的上限
         # Cell: 背景（細胞壁）很少，需要加權背景，但不要太極端
-        # Root: 前景（根系）很少，需要加權前景
-        self.fg_weight_max = {0: 3.0, 1: 5.0, 2: 10.0}
+        # Other: 通用預設
+        self.fg_weight_max = {0: 3.0, 1: 5.0, 2: 5.0}
         
         # 轉換為 tensor 以便向量化（最多支援 10 個任務）
         max_tasks = 10
@@ -158,7 +158,7 @@ class OptimizedBoundaryAwareLoss(nn.Module):
         向量化的分割損失
         
         關鍵改進：雙向類別平衡
-        - 當前景少時（如 Root）：加權前景
+        - 當前景少時（如某些 Other 任務）：加權前景
         - 當背景少時（如 Cell 的細胞壁）：加權背景
         """
         B = pred.shape[0]
@@ -368,7 +368,7 @@ class OptimizedMultiTaskTrainer:
         
         # 任務配置
         self.num_tasks = self.config.get('num_tasks', 3)
-        self.task_names = self.config.get('task_names', {0: 'Cell', 1: 'Blood', 2: 'Root'})
+        self.task_names = self.config.get('task_names', {0: 'Cell', 1: 'Blood', 2: 'Other'})
         if isinstance(self.task_names, list):
             self.task_names = {i: name for i, name in enumerate(self.task_names)}
         
@@ -386,6 +386,7 @@ class OptimizedMultiTaskTrainer:
         print(f"\n{'='*60}")
         print(f"Training Configuration:")
         print(f"  Number of tasks: {self.num_tasks}")
+        print(f"  Task names: {self.task_names}")
         print(f"  Mixed Precision (AMP): {self.use_amp}")
         print(f"  Gradient Accumulation Steps: {self.gradient_accumulation_steps}")
         if self.invert_mask_tasks:
@@ -439,9 +440,9 @@ class OptimizedMultiTaskTrainer:
             'gpu_cache_clear_freq': 50,  # 每多少個 batch 清理一次 GPU 記憶體
             # Cell: 前景是細胞本體（大塊），背景是細胞壁（細線）
             # Blood: 前景是血球（圓形區塊）
-            # Root: 前景是根系（細長，前景很少）
-            'boundary_weights': {0: 1.5, 1: 3.0, 2: 5.0},
-            'foreground_weights': {0: 0.5, 1: 1.5, 2: 3.0},  # Cell 前景大，權重要低
+            # Other: 通用預設，可視資料特性調整
+            'boundary_weights': {0: 1.5, 1: 3.0, 2: 3.0},
+            'foreground_weights': {0: 0.5, 1: 1.5, 2: 1.5},  # Cell 前景大，權重要低
             'use_deep_supervision': True,
         }
     
@@ -569,8 +570,8 @@ class OptimizedMultiTaskTrainer:
         
         # 損失函數
         self.criterion = OptimizedBoundaryAwareLoss(
-            boundary_weights=self.config.get('boundary_weights', {0: 1.5, 1: 3.0, 2: 5.0}),
-            foreground_weights=self.config.get('foreground_weights', {0: 0.5, 1: 1.5, 2: 3.0}),
+            boundary_weights=self.config.get('boundary_weights', {0: 1.5, 1: 3.0, 2: 3.0}),
+            foreground_weights=self.config.get('foreground_weights', {0: 0.5, 1: 1.5, 2: 1.5}),
             deep_supervision_weights=self.config.get('deep_supervision_weights', [0.4, 0.2, 0.1]),
         ).to(self.device)
         
@@ -783,16 +784,20 @@ class OptimizedMultiTaskTrainer:
     
     @torch.no_grad()
     def validate(self, epoch):
-        """驗證（優化版，加入更好的記憶體管理）"""
+        """驗證（修復版：逐 batch 累加 metrics，避免 CPU OOM）"""
         # 驗證前徹底清理 GPU 記憶體
         clear_gpu_memory()
         
         self.model.eval()
         total_loss = 0.0
         loss_components = {}
-        all_preds = []
-        all_targets = []
-        all_task_ids = []
+        
+        # ====== 串流累加器（不再存全部預測） ======
+        # 每個任務的 intersection, pred_sum, target_sum, count
+        task_accum = {}
+        for tid in range(self.num_tasks):
+            task_accum[tid] = {'intersection': 0.0, 'pred_sum': 0.0, 'target_sum': 0.0, 'count': 0}
+        overall_accum = {'intersection': 0.0, 'pred_sum': 0.0, 'target_sum': 0.0, 'count': 0}
         
         # 收集每個任務的樣本用於視覺化
         task_samples = {i: None for i in range(self.num_tasks)}
@@ -823,29 +828,49 @@ class OptimizedMultiTaskTrainer:
             else:
                 seg_out = outputs
             
-            # 立即轉移到 CPU 並刪除 GPU 上的變量
-            pred_cpu = torch.sigmoid(seg_out).cpu()
-            masks_cpu = masks.cpu()
+            # 在 GPU 上計算二值化（比搬到 CPU 再算更快）
+            pred_binary = (torch.sigmoid(seg_out) > 0.5).float()
+            masks_float = masks.float()
             task_ids_cpu = task_ids.cpu()
             
-            all_preds.append(pred_cpu)
-            all_targets.append(masks_cpu)
-            all_task_ids.append(task_ids_cpu)
+            # ====== 逐 batch 累加 metrics ======
+            B = pred_binary.shape[0]
+            for i in range(B):
+                tid = task_ids_cpu[i].item()
+                p = pred_binary[i].view(-1)
+                t = masks_float[i].view(-1)
+                
+                inter = (p * t).sum().item()
+                p_sum = p.sum().item()
+                t_sum = t.sum().item()
+                
+                task_accum[tid]['intersection'] += inter
+                task_accum[tid]['pred_sum'] += p_sum
+                task_accum[tid]['target_sum'] += t_sum
+                task_accum[tid]['count'] += 1
+                
+                overall_accum['intersection'] += inter
+                overall_accum['pred_sum'] += p_sum
+                overall_accum['target_sum'] += t_sum
+                overall_accum['count'] += 1
             
             # 收集每個任務的第一個樣本用於視覺化
+            pred_cpu_for_vis = seg_out.cpu()
+            masks_cpu_for_vis = masks.cpu()
             batch_size = images.shape[0]
             for i in range(batch_size):
                 task_id = task_ids_cpu[i].item()
                 if task_id < self.num_tasks and task_samples.get(task_id) is None:
                     task_samples[task_id] = {
                         'image': images[i:i+1].cpu(),
-                        'mask': masks_cpu[i:i+1],
-                        'pred': seg_out[i:i+1].cpu(),
+                        'mask': masks_cpu_for_vis[i:i+1],
+                        'pred': pred_cpu_for_vis[i:i+1],
                         'task_id': task_id
                     }
             
             # 明確刪除 GPU 變量
-            del outputs, loss, seg_out, images, masks, task_ids
+            del outputs, loss, seg_out, pred_binary, masks_float
+            del images, masks, task_ids, pred_cpu_for_vis, masks_cpu_for_vis
             
             # 定期清理 GPU 記憶體
             cache_clear_freq = self.config.get('gpu_cache_clear_freq', 30)
@@ -855,15 +880,11 @@ class OptimizedMultiTaskTrainer:
         # 驗證結束徹底清理
         clear_gpu_memory()
         
-        # 計算指標
-        all_preds = torch.cat(all_preds, dim=0)
-        all_targets = torch.cat(all_targets, dim=0)
-        all_task_ids = torch.cat(all_task_ids, dim=0)
+        # ====== 從累加器計算最終 metrics ======
+        metrics = self._compute_metrics_from_accum(task_accum, overall_accum)
         
-        metrics = self._compute_metrics(all_preds, all_targets, all_task_ids)
-        
-        avg_loss = total_loss / len(self.val_loader)
-        avg_components = {k: v / len(self.val_loader) for k, v in loss_components.items()}
+        avg_loss = total_loss / max(len(self.val_loader), 1)
+        avg_components = {k: v / max(len(self.val_loader), 1) for k, v in loss_components.items()}
         
         # 列印驗證結果
         print(f"\nValidation Loss: {avg_loss:.4f}")
@@ -879,42 +900,32 @@ class OptimizedMultiTaskTrainer:
         
         return avg_loss, metrics, avg_components, task_samples
     
-    def _compute_metrics(self, preds, targets, task_ids, threshold=0.5):
-        """計算分割指標"""
-        preds_binary = (preds > threshold).float()
-        
+    def _compute_metrics_from_accum(self, task_accum, overall_accum):
+        """從串流累加器計算 IoU 和 Dice（零額外記憶體）"""
+        eps = 1e-7
         metrics = {
             'overall': {'iou': 0, 'dice': 0, 'count': 0}
         }
         for i in range(self.num_tasks):
             metrics[i] = {'iou': 0, 'dice': 0, 'count': 0}
         
-        for task_id in range(self.num_tasks):
-            mask = (task_ids == task_id)
-            if mask.sum() == 0:
+        for tid in range(self.num_tasks):
+            a = task_accum[tid]
+            if a['count'] == 0:
                 continue
-            
-            task_preds = preds_binary[mask]
-            task_targets = targets[mask]
-            
-            # IoU
-            intersection = (task_preds * task_targets).sum()
-            union = task_preds.sum() + task_targets.sum() - intersection
-            iou = (intersection + 1e-7) / (union + 1e-7)
-            
-            # Dice
-            dice = (2 * intersection + 1e-7) / (task_preds.sum() + task_targets.sum() + 1e-7)
-            
-            metrics[task_id]['iou'] = iou.item()
-            metrics[task_id]['dice'] = dice.item()
-            metrics[task_id]['count'] = mask.sum().item()
+            inter = a['intersection']
+            union = a['pred_sum'] + a['target_sum'] - inter
+            metrics[tid]['iou'] = (inter + eps) / (union + eps)
+            metrics[tid]['dice'] = (2 * inter + eps) / (a['pred_sum'] + a['target_sum'] + eps)
+            metrics[tid]['count'] = a['count']
         
-        # Overall
-        intersection = (preds_binary * targets).sum()
-        union = preds_binary.sum() + targets.sum() - intersection
-        metrics['overall']['iou'] = ((intersection + 1e-7) / (union + 1e-7)).item()
-        metrics['overall']['dice'] = ((2 * intersection + 1e-7) / (preds_binary.sum() + targets.sum() + 1e-7)).item()
-        metrics['overall']['count'] = len(preds)
+        a = overall_accum
+        if a['count'] > 0:
+            inter = a['intersection']
+            union = a['pred_sum'] + a['target_sum'] - inter
+            metrics['overall']['iou'] = (inter + eps) / (union + eps)
+            metrics['overall']['dice'] = (2 * inter + eps) / (a['pred_sum'] + a['target_sum'] + eps)
+            metrics['overall']['count'] = a['count']
         
         return metrics
     
