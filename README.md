@@ -558,4 +558,4 @@ A task-conditioned multi-task TransUNet for biological image segmentation
 
 Should you have any questions or suggestions, feedback is most welcome.
 
-Best of luck with your training.
+Best of luck with your training. Developer: Shitephen (email: gn03138868@gmail.com; shitephenwang@ntu.edu.tw)
