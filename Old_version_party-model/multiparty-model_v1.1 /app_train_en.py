@@ -46,13 +46,7 @@ def start_training(batch_size, epochs, lr, patch_size, num_layers, data_path,
             'data_path': data_path,
             'task_structure': 'subfolder',
             'boundary_weights': {0: 2.0, 1: 3.0, 2: 5.0},
-            'foreground_weights': {0: 1.0, 1: 1.5, 2: 3.0},
-            # 新增參數
-            'invert_mask_tasks': [],  # 如果需要反轉 Cell 的 mask，改成 [0]
-            'gradient_accumulation_steps': 2,  # 梯度累積，減少 GPU 記憶體使用
-            'gpu_cache_clear_freq': 20,  # 更頻繁清理 GPU 記憶體
-            'use_amp': True,  # 混合精度訓練
-            'num_tasks': 3,
+            'foreground_weights': {0: 1.0, 1: 1.5, 2: 3.0}
         }
         
         # Add pre-trained settings
@@ -87,7 +81,7 @@ def start_training(batch_size, epochs, lr, patch_size, num_layers, data_path,
             
             try:
                 print("\n" + "="*60)
-                print("Starting Training...")
+                print("🚀 Starting Training...")
                 print("="*60)
                 print(f"Configuration file: {config_path}")
                 print(f"Log file: {log_file}")
@@ -98,7 +92,7 @@ def start_training(batch_size, epochs, lr, patch_size, num_layers, data_path,
                 
                 # Start training process
                 training_process = subprocess.Popen(
-                    [sys.executable, 'train_multitask_optimized.py', '--config', str(config_path)],
+                    [sys.executable, 'train_multitask.py', '--config', str(config_path)],
                 )
                 
                 training_status['message'] = '✅ Training has started! Please check the terminal window for detailed output.'
@@ -126,9 +120,9 @@ def start_training(batch_size, epochs, lr, patch_size, num_layers, data_path,
         training_thread.start()
         
         return f"""
-Training has been successfully started!
+✅ Training has been successfully started!
 
-Training Configuration:
+📊 Training Configuration:
 • Batch Size: {batch_size}
 • Epochs: {epochs}
 • Learning Rate: {lr}
@@ -137,13 +131,13 @@ Training Configuration:
 • Data Path: {data_path}
 • Pre-trained Model: {'Yes (' + pretrained_path + ')' if use_pretrained else 'No'}
 
-Tips:
+💡 Tips:
 • Detailed training output will be displayed in the terminal (CMD/Terminal)
 • Please keep the terminal window open to view training progress
 • Models will be automatically saved to outputs/models/
 • Training history will be saved to outputs/training_history.json
 
-Click "Refresh Training Status" to view current progress
+🔄 Click "Refresh Training Status" to view current progress
 """
         
     except Exception as e:
@@ -194,13 +188,13 @@ def get_training_status():
                 return f"""
 🔄 Training in progress...
 
-Current Progress:
+📊 Current Progress:
 • Epoch: {current_epoch}/{training_status['total_epochs']}
 • Train Loss: {train_loss:.4f}
 • Val Loss: {val_loss:.4f}
 • Val IoU: {val_iou:.4f}
 
-Tip: Detailed training output is displayed in the terminal window
+💡 Tip: Detailed training output is displayed in the terminal window
 """
         except:
             pass
@@ -439,7 +433,7 @@ def refresh_monitoring():
 # Create Gradio interface
 with gr.Blocks(title="TransUNet Training Interface") as demo:
     
-    gr.Markdown("# TransUNet Multi-Task Training Interface")
+    gr.Markdown("# 🚀 TransUNet Multi-Task Training Interface")
     gr.Markdown("Dedicated to model training | For prediction, please use Tkinter GUI (app_gui.py)")
     
     with gr.Row():
@@ -482,7 +476,7 @@ with gr.Blocks(title="TransUNet Training Interface") as demo:
                 info="Dataset path"
             )
             
-            check_data_btn = gr.Button("Check Data Structure", variant="secondary")
+            check_data_btn = gr.Button("🔍 Check Data Structure", variant="secondary")
             data_check_output = gr.Textbox(
                 label="Data Check Results",
                 lines=10,
@@ -506,10 +500,10 @@ with gr.Blocks(title="TransUNet Training Interface") as demo:
             gr.Markdown("## 🎮 Training Control")
             
             with gr.Row():
-                start_btn = gr.Button("Start Training", variant="primary", size="lg")
-                stop_btn = gr.Button("Stop Training", variant="stop", size="lg")
+                start_btn = gr.Button("🚀 Start Training", variant="primary", size="lg")
+                stop_btn = gr.Button("⏹️ Stop Training", variant="stop", size="lg")
             
-            refresh_btn = gr.Button("Refresh Training Status", variant="secondary")
+            refresh_btn = gr.Button("🔄 Refresh Training Status", variant="secondary")
             
             training_output = gr.Textbox(
                 label="Training Messages",
@@ -518,12 +512,12 @@ with gr.Blocks(title="TransUNet Training Interface") as demo:
             )
     
     # Training monitoring tab
-    with gr.Tab("Training Monitoring"):
-        gr.Markdown("## Training Results Monitoring")
+    with gr.Tab("📊 Training Monitoring"):
+        gr.Markdown("## 📊 Training Results Monitoring")
         
         with gr.Row():
             with gr.Column():
-                refresh_monitor_btn = gr.Button("Refresh Monitoring", variant="primary")
+                refresh_monitor_btn = gr.Button("🔄 Refresh Monitoring", variant="primary")
                 
                 gr.Markdown("### Training Curves")
                 training_curve = gr.Image(
@@ -554,9 +548,9 @@ with gr.Blocks(title="TransUNet Training Interface") as demo:
         )
     
     # User guide
-    with gr.Tab("User Guide"):
+    with gr.Tab("📖 User Guide"):
         gr.Markdown("""
-## User Guide
+## 📝 User Guide
 
 ### 1. Prepare Data
 Ensure your data structure is as follows:
@@ -593,14 +587,14 @@ You can have 2, 3, or more tasks - just create the appropriate folders.
 - Training history: `outputs/training_history.json`
 - Logs: `outputs/training_ui.log`
 
-### Tips
+### 💡 Tips
 - Training process will display detailed information in the terminal
 - Please keep the terminal window open
 - You can stop training at any time
 - Use a pre-trained model to continue training
 
-### Related Tools
-- **Prediction and Inference**: Use `app_gui_en.py` (Tkinter GUI)
+### 🔗 Related Tools
+- **Prediction and Inference**: Use `app_gui.py` (Tkinter GUI)
 - **Training Monitoring**: View `outputs/training_history.json`
         """)
     
@@ -643,7 +637,7 @@ You can have 2, 3, or more tasks - just create the appropriate folders.
 
 if __name__ == "__main__":
     print("\n" + "="*60)
-    print("TransUNet Training Interface")
+    print("🚀 TransUNet Training Interface")
     print("="*60)
     print("Dedicated to model training functionality")
     print("For prediction, please use: python app_gui.py")
