@@ -48,7 +48,7 @@ sets up its own private Python, and the program loads the model by itself.
 
 ## Install on Windows / 一鍵安裝
 
-1. Download **`MultiTUNAparty-Windows-Installer.zip`** from the
+1. Download **`MultiTUNAparty_v1.2-Windows-Installer.zip`** from the
    [Releases page](../../releases/latest).
 2. Right-click the zip → **Extract All**. Extract the *whole* folder; do not
    drag one file out of it.
