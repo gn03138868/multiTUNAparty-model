@@ -260,6 +260,8 @@ python train_multitask_optimized.py --config config_training_ui.yaml   # headles
 
 `best_model.pth` is a Releases asset rather than a repository file — it is
 larger than GitHub's 100 MiB per-file limit for repository contents.
+So you can find one on Google Drive here:
+https://drive.google.com/drive/folders/1DDyytvb28C9CVCamu7t48qhi8ZFkQXye?usp=sharing
 
 ---
 
