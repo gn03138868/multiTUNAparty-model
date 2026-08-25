@@ -4,9 +4,9 @@
 
 # MultiTUNAparty
 
-**Segment and measure cells, roots and fungal structures — without writing any code.**
+**Cells, roots and fungi. No code. Ages 8 to 80.**
 
-**細胞、根、真菌構造的影像辨識與量化 —— 完全不用會寫程式。**
+**細胞、根、真菌。一行程式都不用，8歲到80歲都會用。**
 
 [![Windows](https://img.shields.io/badge/Windows-one--click%20installer-0078D6)](#install-on-windows--一鍵安裝)
 [![Python](https://img.shields.io/badge/Python-3.11-3776AB)](https://www.python.org/)
